@@ -4,6 +4,7 @@ import {
   toAssetView,
   updateAssetMetadata,
 } from "$lib/server/assets";
+import { requireUserCapability } from "$lib/server/auth";
 
 function parseTags(input: string): string[] {
   return input
@@ -12,7 +13,11 @@ function parseTags(input: string): string[] {
     .filter(Boolean);
 }
 
-export const PATCH: RequestHandler = async ({ params, request }) => {
+export const PATCH: RequestHandler = async ({ locals, params, request }) => {
+  if (!(await requireUserCapability(locals.user, "asset.update"))) {
+    return json({ error: "Forbidden." }, { status: 403 });
+  }
+
   if (!params.id) {
     return json({ error: "Missing asset id." }, { status: 400 });
   }
@@ -76,7 +81,11 @@ export const PATCH: RequestHandler = async ({ params, request }) => {
   return json({ asset: toAssetView(record) });
 };
 
-export const DELETE: RequestHandler = async ({ params }) => {
+export const DELETE: RequestHandler = async ({ locals, params }) => {
+  if (!(await requireUserCapability(locals.user, "asset.delete"))) {
+    return json({ error: "Forbidden." }, { status: 403 });
+  }
+
   if (!params.id) {
     return json({ error: "Missing asset id." }, { status: 400 });
   }

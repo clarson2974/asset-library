@@ -7,6 +7,7 @@ import {
   replaceAssetFile,
   toAssetView,
 } from "$lib/server/assets";
+import { requireUserCapability } from "$lib/server/auth";
 
 const FILE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 
@@ -64,7 +65,14 @@ function buildCacheHeaders(
   };
 }
 
-export const GET: RequestHandler = async ({ params, request }) => {
+export const GET: RequestHandler = async ({ locals, params, request }) => {
+  if (!(await requireUserCapability(locals.user, "asset.read"))) {
+    return new Response(JSON.stringify({ error: "Forbidden." }), {
+      status: 403,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
   const asset = await resolveAssetOrThrow(params.id);
 
   let bytes: Buffer;
@@ -114,7 +122,11 @@ export const GET: RequestHandler = async ({ params, request }) => {
   });
 };
 
-export const HEAD: RequestHandler = async ({ params }) => {
+export const HEAD: RequestHandler = async ({ locals, params }) => {
+  if (!(await requireUserCapability(locals.user, "asset.read"))) {
+    return new Response(null, { status: 403 });
+  }
+
   const asset = await resolveAssetOrThrow(params.id);
 
   return new Response(null, {
@@ -128,7 +140,11 @@ export const HEAD: RequestHandler = async ({ params }) => {
   });
 };
 
-export const PATCH: RequestHandler = async ({ params, request }) => {
+export const PATCH: RequestHandler = async ({ locals, params, request }) => {
+  if (!(await requireUserCapability(locals.user, "asset.update"))) {
+    return json({ error: "Forbidden." }, { status: 403 });
+  }
+
   if (!params.id) {
     return json({ error: "Missing asset id." }, { status: 400 });
   }

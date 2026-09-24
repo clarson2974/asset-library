@@ -5,6 +5,7 @@ import {
   saveAsset,
   toAssetView,
 } from "$lib/server/assets";
+import { requireUserCapability } from "$lib/server/auth";
 
 function parseTags(input: string): string[] {
   return input
@@ -13,12 +14,20 @@ function parseTags(input: string): string[] {
     .filter(Boolean);
 }
 
-export const GET: RequestHandler = async () => {
+export const GET: RequestHandler = async ({ locals }) => {
+  if (!(await requireUserCapability(locals.user, "asset.read"))) {
+    return json({ error: "Forbidden." }, { status: 403 });
+  }
+
   const assets = await readAssets();
   return json({ assets: assets.map(toAssetView) });
 };
 
-export const POST: RequestHandler = async ({ request }) => {
+export const POST: RequestHandler = async ({ locals, request }) => {
+  if (!(await requireUserCapability(locals.user, "asset.create"))) {
+    return json({ error: "Forbidden." }, { status: 403 });
+  }
+
   const form = await request.formData();
   const titleValue = form.get("title");
   const tagsValue = form.get("tags");

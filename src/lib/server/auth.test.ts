@@ -62,4 +62,13 @@ describe("auth storage", () => {
       }),
     ).rejects.toThrow("Invalid email or password");
   });
+
+  it("grants the default administrator role the required asset and settings capabilities", async () => {
+    const auth = await loadAuthModule();
+    const user = await auth.ensureAdminUser();
+
+    expect(await auth.userHasCapability(user.id, "asset.read")).toBe(true);
+    expect(await auth.userHasCapability(user.id, "asset.create")).toBe(true);
+    expect(await auth.userHasCapability(user.id, "settings.manage")).toBe(true);
+  });
 });

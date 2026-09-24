@@ -3,10 +3,19 @@ import { createHash, pbkdf2Sync } from "node:crypto";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+export type UserRole = "admin" | "editor" | "viewer";
+export type Capability =
+  | "asset.read"
+  | "asset.create"
+  | "asset.update"
+  | "asset.delete"
+  | "settings.manage";
+
 export type AuthUser = {
   id: string;
   email: string;
   displayName: string;
+  role: UserRole;
   status: "active" | "disabled";
   createdAt: string;
   lastLoginAt?: string;
@@ -30,6 +39,11 @@ const SESSION_COOKIE_NAME = "asset_library_session";
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30;
 const DEFAULT_ADMIN_EMAIL = "admin@localhost";
 const DEFAULT_ADMIN_PASSWORD = "admin";
+const ROLE_CAPABILITIES: Record<UserRole, Capability[]> = {
+  admin: ["asset.read", "asset.create", "asset.update", "asset.delete", "settings.manage"],
+  editor: ["asset.read", "asset.create", "asset.update"],
+  viewer: ["asset.read"],
+};
 
 const dataRoot = path.resolve(
   process.env.ASSET_LIBRARY_DATA_DIR?.trim() || path.join(process.cwd(), "data"),
@@ -70,6 +84,7 @@ function ensureAuthTables(database: DatabaseSync): void {
       email TEXT NOT NULL UNIQUE,
       email_normalized TEXT NOT NULL UNIQUE,
       display_name TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'admin',
       password_hash TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'active',
       created_at TEXT NOT NULL,
@@ -138,14 +153,18 @@ function rowToUser(row: {
   id: string;
   email: string;
   display_name: string;
+  role?: string | null;
   status: string;
   created_at: string;
   last_login_at?: string | null;
 }): AuthUser {
+  const role = row.role === "editor" || row.role === "viewer" ? row.role : "admin";
+
   return {
     id: row.id,
     email: row.email,
     displayName: row.display_name,
+    role,
     status: row.status === "disabled" ? "disabled" : "active",
     createdAt: row.created_at,
     lastLoginAt: row.last_login_at ?? undefined,
@@ -159,12 +178,13 @@ export function getSessionCookieName(): string {
 export async function ensureAdminUser(): Promise<AuthUser> {
   const database = getDataDb();
   const row = database
-    .prepare("SELECT id, email, display_name, status, created_at, last_login_at FROM users LIMIT 1")
+    .prepare("SELECT id, email, display_name, role, status, created_at, last_login_at FROM users LIMIT 1")
     .get() as
     | {
         id: string;
         email: string;
         display_name: string;
+        role?: string | null;
         status: string;
         created_at: string;
         last_login_at?: string | null;
@@ -190,6 +210,7 @@ export async function ensureAdminUser(): Promise<AuthUser> {
           email,
           email_normalized,
           display_name,
+          role,
           password_hash,
           status,
           created_at,
@@ -200,6 +221,7 @@ export async function ensureAdminUser(): Promise<AuthUser> {
           @email,
           @email_normalized,
           @display_name,
+          @role,
           @password_hash,
           @status,
           @created_at,
@@ -213,6 +235,7 @@ export async function ensureAdminUser(): Promise<AuthUser> {
       email,
       email_normalized: email,
       display_name: "Administrator",
+      role: "admin",
       password_hash: hashPassword(password),
       status: "active",
       created_at: now,
@@ -224,6 +247,7 @@ export async function ensureAdminUser(): Promise<AuthUser> {
     id,
     email,
     displayName: "Administrator",
+    role: "admin",
     status: "active",
     createdAt: now,
   };
@@ -242,6 +266,7 @@ export async function loginWithCredentials(params: {
           id,
           email,
           display_name,
+          role,
           status,
           created_at,
           last_login_at,
@@ -372,7 +397,7 @@ export function getSessionFromCookies(cookies: {
   const userRow = database
     .prepare(
       `
-        SELECT id, email, display_name, status, created_at, last_login_at
+        SELECT id, email, display_name, role, status, created_at, last_login_at
         FROM users
         WHERE id = ? AND status = 'active'
         LIMIT 1
@@ -383,6 +408,7 @@ export function getSessionFromCookies(cookies: {
         id: string;
         email: string;
         display_name: string;
+        role?: string | null;
         status: string;
         created_at: string;
         last_login_at?: string | null;
@@ -402,6 +428,41 @@ export function getSessionFromCookies(cookies: {
 
 export function destroySession(cookies: { delete(name: string, options?: { path?: string }): void }): void {
   cookies.delete(SESSION_COOKIE_NAME, { path: "/" });
+}
+
+export async function userHasCapability(
+  userId: string,
+  capability: Capability,
+): Promise<boolean> {
+  const database = getDataDb();
+  const userRow = database
+    .prepare(
+      `
+        SELECT role
+        FROM users
+        WHERE id = ? AND status = 'active'
+        LIMIT 1
+      `,
+    )
+    .get(userId) as { role?: string | null } | undefined;
+
+  if (!userRow) {
+    return false;
+  }
+
+  const role = userRow.role === "editor" || userRow.role === "viewer" ? userRow.role : "admin";
+  return ROLE_CAPABILITIES[role].includes(capability);
+}
+
+export async function requireUserCapability(
+  user: AuthUser | undefined,
+  capability: Capability,
+): Promise<boolean> {
+  if (!user) {
+    return false;
+  }
+
+  return ROLE_CAPABILITIES[user.role].includes(capability);
 }
 
 export function ensureAuthBootstrap(): void {
