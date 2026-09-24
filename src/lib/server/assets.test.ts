@@ -55,6 +55,93 @@ describe("asset storage", () => {
     );
   });
 
+  it("supports multiple files and replaces only the selected child file", async () => {
+    const assets = await loadAssetsModule();
+    const record = await assets.saveAsset({
+      title: "Character pack",
+      tags: [],
+      fileName: "hero.blend",
+      mimeType: "application/octet-stream",
+      size: 5,
+      bytes: new TextEncoder().encode("blend"),
+    });
+
+    const texture = await assets.addAssetFile(record.id, {
+      fileName: "hero_basecolor.png",
+      mimeType: "image/png",
+      size: 7,
+      bytes: new TextEncoder().encode("texture"),
+      role: "texture",
+      variant: "4k",
+    });
+    expect(texture).toMatchObject({
+      assetId: record.id,
+      role: "texture",
+      variant: "4k",
+    });
+
+    const before = await assets.getAssetById(record.id);
+    expect(before?.files).toHaveLength(2);
+    const source = before?.files.find((file) => file.role === "source");
+    expect(source).toBeDefined();
+
+    const replacement = await assets.replaceAssetChildFile(record.id, texture!.id, {
+      fileName: "hero_basecolor_v2.png",
+      mimeType: "image/png",
+      size: 9,
+      bytes: new TextEncoder().encode("texture-v2"),
+      role: "texture",
+      variant: "4k",
+    });
+
+    expect(replacement).toMatchObject({
+      id: texture!.id,
+      originalName: "hero_basecolor_v2.png",
+    });
+    const after = await assets.getAssetById(record.id);
+    expect(after?.files).toHaveLength(2);
+    expect(after?.files.find((file) => file.role === "source")).toMatchObject({
+      id: source!.id,
+      originalName: "hero.blend",
+    });
+    expect(after?.files.find((file) => file.id === texture!.id)).toMatchObject({
+      originalName: "hero_basecolor_v2.png",
+    });
+
+    await expect(assets.deleteAsset(record.id)).resolves.toBe(true);
+    await expect(readFile(assets.getStoredFilePath(source!.storedName))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(readFile(assets.getStoredFilePath(texture!.storedName))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("stores logical asset relationships", async () => {
+    const assets = await loadAssetsModule();
+    const pack = await assets.saveAsset({
+      title: "Pack",
+      tags: [],
+      fileName: "pack.txt",
+      mimeType: "text/plain",
+      size: 4,
+      bytes: new TextEncoder().encode("pack"),
+    });
+    const member = await assets.saveAsset({
+      title: "Member",
+      tags: [],
+      fileName: "member.txt",
+      mimeType: "text/plain",
+      size: 6,
+      bytes: new TextEncoder().encode("member"),
+    });
+
+    await expect(assets.addAssetRelation(pack.id, member.id, "contains")).resolves.toBe(true);
+    await expect(assets.listAssetRelations(pack.id)).resolves.toEqual([
+      { parentAssetId: pack.id, childAssetId: member.id, relationType: "contains" },
+    ]);
+  });
+
   it("serves the stored bytes through the download handler", async () => {
     const assets = await loadAssetsModule();
     const record = await assets.saveAsset({

@@ -6,7 +6,10 @@ import { DatabaseSync } from "node:sqlite";
 import { TextDecoder } from "node:util";
 import type {
   AssetCategory,
+  AssetFileRecord,
+  AssetFileRole,
   AssetPreviewKind,
+  AssetRelation,
   AssetRecord,
   AssetView,
 } from "$lib/types";
@@ -89,6 +92,25 @@ type AssetRow = {
   height: number | null;
 };
 
+type AssetFileRow = {
+  id: string;
+  asset_id: string;
+  role: string;
+  variant: string;
+  original_name: string;
+  stored_name: string;
+  file_type: string;
+  hash: string | null;
+  mime_type: string;
+  size: number;
+  category: string;
+  preview_kind: string;
+  width: number | null;
+  height: number | null;
+  metadata_json: string;
+  created_at: string;
+};
+
 type DatabaseHealth =
   | {
       ok: true;
@@ -140,7 +162,91 @@ const migrations: MigrationDefinition[] = [
       database.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_hash ON assets(hash)");
     },
   },
+  {
+    id: "003_logical_assets_and_files",
+    description: "Create logical asset files and migrate each legacy file into a child record.",
+    run(database) {
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS asset_files (
+          id TEXT PRIMARY KEY,
+          asset_id TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'source',
+          variant TEXT NOT NULL DEFAULT '',
+          original_name TEXT NOT NULL,
+          stored_name TEXT NOT NULL UNIQUE,
+          file_type TEXT NOT NULL,
+          hash TEXT,
+          mime_type TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          category TEXT NOT NULL,
+          preview_kind TEXT NOT NULL,
+          width INTEGER,
+          height INTEGER,
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL,
+          FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+        );
+      `);
+      database.exec(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_files_hash ON asset_files(hash) WHERE hash IS NOT NULL",
+      );
+      database.exec(
+        "CREATE INDEX IF NOT EXISTS idx_asset_files_asset_id ON asset_files(asset_id)",
+      );
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS asset_relations (
+          parent_asset_id TEXT NOT NULL,
+          child_asset_id TEXT NOT NULL,
+          relation_type TEXT NOT NULL,
+          PRIMARY KEY (parent_asset_id, child_asset_id, relation_type),
+          FOREIGN KEY (parent_asset_id) REFERENCES assets(id) ON DELETE CASCADE,
+          FOREIGN KEY (child_asset_id) REFERENCES assets(id) ON DELETE CASCADE
+        );
+      `);
+      database.exec(
+        "CREATE INDEX IF NOT EXISTS idx_asset_relations_child ON asset_relations(child_asset_id)",
+      );
+
+      const legacyRows = database
+        .prepare(
+          `
+            SELECT id, original_name, stored_name, file_type, hash, mime_type,
+              size, category, preview_kind, width, height, upload_date
+            FROM assets
+            WHERE NOT EXISTS (
+              SELECT 1 FROM asset_files WHERE asset_files.asset_id = assets.id
+            )
+          `,
+        )
+        .all() as Array<AssetRow>;
+      const insertFile = database.prepare(`
+        INSERT INTO asset_files (
+          id, asset_id, role, variant, original_name, stored_name, file_type,
+          hash, mime_type, size, category, preview_kind, width, height,
+          metadata_json, created_at
+        ) VALUES (?, ?, 'source', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?)
+      `);
+      for (const row of legacyRows) {
+        insertFile.run(
+          `${row.id}:primary`,
+          row.id,
+          row.original_name,
+          row.stored_name,
+          row.file_type,
+          row.hash,
+          row.mime_type,
+          row.size,
+          row.category,
+          row.preview_kind,
+          row.width,
+          row.height,
+          row.upload_date,
+        );
+      }
+    },
+  },
 ];
+const knownExternalMigrationIds = new Set(["002_auth_tables"]);
 
 let db: DatabaseSync | undefined;
 let storageReady: Promise<void> | undefined;
@@ -204,7 +310,9 @@ function applyMigrations(database: DatabaseSync): void {
       .all() as Array<{ id: string }>).map((row) => row.id),
   );
   const unknownAppliedMigrations = [...appliedMigrationIds].filter(
-    (migrationId) => !migrations.some((migration) => migration.id === migrationId),
+    (migrationId) =>
+      !migrations.some((migration) => migration.id === migrationId) &&
+      !knownExternalMigrationIds.has(migrationId),
   );
 
   if (unknownAppliedMigrations.length > 0) {
@@ -394,7 +502,79 @@ function rowToAssetRecord(row: AssetRow): AssetRecord {
         : fallbackPreviewKind,
     width: typeof row.width === "number" ? row.width : undefined,
     height: typeof row.height === "number" ? row.height : undefined,
+    files: [],
   };
+}
+
+function normalizeFileRole(value: string): AssetFileRole {
+  const roles: AssetFileRole[] = [
+    "source",
+    "model",
+    "texture",
+    "animation",
+    "audio",
+    "preview",
+    "document",
+    "other",
+  ];
+  return roles.includes(value as AssetFileRole)
+    ? (value as AssetFileRole)
+    : "other";
+}
+
+function rowToAssetFile(row: AssetFileRow): AssetFileRecord {
+  let metadata: Record<string, unknown> | undefined;
+  try {
+    const parsed = JSON.parse(row.metadata_json);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      metadata = parsed as Record<string, unknown>;
+    }
+  } catch {
+    metadata = undefined;
+  }
+
+  return {
+    id: row.id,
+    assetId: row.asset_id,
+    role: normalizeFileRole(row.role),
+    variant: row.variant,
+    originalName: row.original_name,
+    storedName: row.stored_name,
+    fileType: row.file_type,
+    hash: row.hash?.trim() || undefined,
+    mimeType: row.mime_type,
+    size: Number(row.size),
+    category: (row.category || "other") as AssetCategory,
+    previewKind: ["audio", "image", "model", "text", "none"].includes(
+      row.preview_kind,
+    )
+      ? (row.preview_kind as AssetPreviewKind)
+      : "none",
+    width: typeof row.width === "number" ? row.width : undefined,
+    height: typeof row.height === "number" ? row.height : undefined,
+    metadata,
+    createdAt: row.created_at,
+  };
+}
+
+function getAssetFiles(database: DatabaseSync, assetId: string): AssetFileRecord[] {
+  const rows = database
+    .prepare(
+      `
+        SELECT id, asset_id, role, variant, original_name, stored_name, file_type,
+          hash, mime_type, size, category, preview_kind, width, height,
+          metadata_json, created_at
+        FROM asset_files
+        WHERE asset_id = ?
+        ORDER BY created_at ASC, id ASC
+      `,
+    )
+    .all(assetId) as AssetFileRow[];
+  return rows.map(rowToAssetFile);
+}
+
+function hydrateAsset(database: DatabaseSync, record: AssetRecord): AssetRecord {
+  return { ...record, files: getAssetFiles(database, record.id) };
 }
 
 function insertRecord(database: DatabaseSync, record: AssetRecord): void {
@@ -464,6 +644,44 @@ function insertRecord(database: DatabaseSync, record: AssetRecord): void {
     });
 }
 
+function insertAssetFile(
+  database: DatabaseSync,
+  file: AssetFileRecord,
+): void {
+  database
+    .prepare(
+      `
+        INSERT INTO asset_files (
+          id, asset_id, role, variant, original_name, stored_name, file_type,
+          hash, mime_type, size, category, preview_kind, width, height,
+          metadata_json, created_at
+        ) VALUES (
+          @id, @asset_id, @role, @variant, @original_name, @stored_name,
+          @file_type, @hash, @mime_type, @size, @category, @preview_kind,
+          @width, @height, @metadata_json, @created_at
+        )
+      `,
+    )
+    .run({
+      id: file.id,
+      asset_id: file.assetId,
+      role: file.role,
+      variant: file.variant,
+      original_name: file.originalName,
+      stored_name: file.storedName,
+      file_type: file.fileType,
+      hash: file.hash ?? null,
+      mime_type: file.mimeType,
+      size: file.size,
+      category: file.category,
+      preview_kind: file.previewKind,
+      width: file.width ?? null,
+      height: file.height ?? null,
+      metadata_json: JSON.stringify(file.metadata ?? {}),
+      created_at: file.createdAt,
+    });
+}
+
 async function migrateLegacyJsonIfNeeded(
   database: DatabaseSync,
 ): Promise<void> {
@@ -508,6 +726,23 @@ async function migrateLegacyJsonIfNeeded(
     for (const record of records) {
       try {
         insertRecord(database, record);
+        insertAssetFile(database, {
+          id: `${record.id}:primary`,
+          assetId: record.id,
+          role: "source",
+          variant: "",
+          originalName: record.originalName,
+          storedName: record.storedName,
+          fileType: record.fileType,
+          hash: record.hash,
+          mimeType: record.mimeType,
+          size: record.size,
+          category: record.category,
+          previewKind: record.previewKind,
+          width: record.width,
+          height: record.height,
+          createdAt: record.uploadDate,
+        });
       } catch {
         // Skip malformed or duplicate legacy entries during migration.
       }
@@ -637,7 +872,7 @@ export async function readAssets(): Promise<AssetRecord[]> {
     )
     .all() as AssetRow[];
 
-  return rows.map(rowToAssetRecord);
+  return rows.map((row) => hydrateAsset(database, rowToAssetRecord(row)));
 }
 
 export function toAssetView(record: AssetRecord): AssetView {
@@ -646,6 +881,12 @@ export function toAssetView(record: AssetRecord): AssetView {
     fileUrl: `/api/assets/${record.id}/file`,
     downloadUrl: `/api/assets/${record.id}/download`,
     textPreviewUrl: `/api/assets/${record.id}/text`,
+    files: record.files.map((file) => ({
+      ...file,
+      fileUrl: `/api/assets/${record.id}/files/${encodeURIComponent(file.id)}`,
+      downloadUrl: `/api/assets/${record.id}/files/${encodeURIComponent(file.id)}/download`,
+      textPreviewUrl: `/api/assets/${record.id}/files/${encodeURIComponent(file.id)}/text`,
+    })),
   };
 }
 
@@ -692,7 +933,9 @@ export async function saveAsset(params: {
       `,
     )
     .get(incomingHash) as AssetRow | undefined;
-  const duplicate = duplicateRow ? rowToAssetRecord(duplicateRow) : undefined;
+  const duplicate = duplicateRow
+    ? hydrateAsset(database, rowToAssetRecord(duplicateRow))
+    : undefined;
   if (duplicate) {
     throw new DuplicateAssetError(duplicate);
   }
@@ -795,12 +1038,32 @@ export async function saveAsset(params: {
     previewKind,
     width,
     height,
+    files: [],
+  };
+
+  const file: AssetFileRecord = {
+    id: randomUUID(),
+    assetId: id,
+    role: "source",
+    variant: "",
+    originalName: record.originalName,
+    storedName: record.storedName,
+    fileType: record.fileType,
+    hash: record.hash,
+    mimeType: record.mimeType,
+    size: record.size,
+    category: record.category,
+    previewKind: record.previewKind,
+    width: record.width,
+    height: record.height,
+    createdAt: record.uploadDate,
   };
 
   await writeFile(path.join(uploadsDir, storedName), params.bytes);
 
   try {
     insertRecord(database, record);
+    insertAssetFile(database, file);
   } catch (errorValue) {
     await rm(path.join(uploadsDir, storedName), { force: true });
 
@@ -836,13 +1099,15 @@ export async function saveAsset(params: {
         )
         .get(incomingHash) as AssetRow | undefined;
       if (existing) {
-        throw new DuplicateAssetError(rowToAssetRecord(existing));
+        throw new DuplicateAssetError(
+          hydrateAsset(database, rowToAssetRecord(existing)),
+        );
       }
     }
     throw errorValue;
   }
 
-  return record;
+  return { ...record, files: [file] };
 }
 
 export async function getAssetById(
@@ -879,7 +1144,214 @@ export async function getAssetById(
     )
     .get(id) as AssetRow | undefined;
 
-  return row ? rowToAssetRecord(row) : undefined;
+  return row ? hydrateAsset(database, rowToAssetRecord(row)) : undefined;
+}
+
+export async function getAssetFileById(
+  assetId: string,
+  fileId: string,
+): Promise<AssetFileRecord | undefined> {
+  await ensureStorage();
+  const database = getDb();
+  const row = database
+    .prepare(
+      `
+        SELECT id, asset_id, role, variant, original_name, stored_name, file_type,
+          hash, mime_type, size, category, preview_kind, width, height,
+          metadata_json, created_at
+        FROM asset_files
+        WHERE asset_id = ? AND id = ?
+        LIMIT 1
+      `,
+    )
+    .get(assetId, fileId) as AssetFileRow | undefined;
+  return row ? rowToAssetFile(row) : undefined;
+}
+
+type AssetFileInput = {
+  fileName: string;
+  mimeType: string;
+  size: number;
+  bytes: Uint8Array;
+  role?: AssetFileRole;
+  variant?: string;
+  metadata?: Record<string, unknown>;
+};
+
+async function buildAssetFile(
+  assetId: string,
+  input: AssetFileInput,
+): Promise<AssetFileRecord> {
+  const mimeType = input.mimeType || "application/octet-stream";
+  const category = getCategory(input.fileName, mimeType);
+  const previewKind = getPreviewKind(category, input.fileName, mimeType);
+  let width: number | undefined;
+  let height: number | undefined;
+  if (previewKind === "image") {
+    try {
+      const { default: sizeOf } = await import("image-size");
+      const dimensions = sizeOf(Buffer.from(input.bytes));
+      width = dimensions.width;
+      height = dimensions.height;
+    } catch {
+      // Image dimensions are optional metadata.
+    }
+  }
+
+  const fileId = randomUUID();
+  return {
+    id: fileId,
+    assetId,
+    role: normalizeFileRole(input.role ?? "other"),
+    variant: input.variant?.trim() ?? "",
+    originalName: input.fileName,
+    storedName: `${fileId}${path.extname(input.fileName)}`,
+    fileType: getFileType(input.fileName, mimeType),
+    hash: computeAssetHash(input.bytes),
+    mimeType,
+    size: input.size,
+    category,
+    previewKind,
+    width,
+    height,
+    metadata: input.metadata,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+export async function addAssetFile(
+  assetId: string,
+  input: AssetFileInput,
+): Promise<AssetFileRecord | undefined> {
+  await ensureStorage();
+  const database = getDb();
+  if (!(await getAssetById(assetId))) {
+    return undefined;
+  }
+
+  const file = await buildAssetFile(assetId, input);
+  const duplicateRow = database
+    .prepare("SELECT asset_id FROM asset_files WHERE hash = ? LIMIT 1")
+    .get(file.hash ?? null) as { asset_id: string } | undefined;
+  if (duplicateRow) {
+    const duplicate = await getAssetById(duplicateRow.asset_id);
+    if (duplicate) {
+      throw new DuplicateAssetError(duplicate);
+    }
+  }
+
+  await writeFile(getStoredFilePath(file.storedName), input.bytes);
+  try {
+    insertAssetFile(database, file);
+  } catch (errorValue) {
+    await rm(getStoredFilePath(file.storedName), { force: true });
+    throw errorValue;
+  }
+  return file;
+}
+
+export async function replaceAssetChildFile(
+  assetId: string,
+  fileId: string,
+  replacement: AssetFileInput,
+): Promise<AssetFileRecord | undefined> {
+  await ensureStorage();
+  const database = getDb();
+  const current = await getAssetFileById(assetId, fileId);
+  if (!current) {
+    return undefined;
+  }
+
+  const replacementFile = await buildAssetFile(assetId, replacement);
+  replacementFile.id = fileId;
+  const duplicateRow = database
+    .prepare("SELECT asset_id FROM asset_files WHERE hash = ? AND id != ? LIMIT 1")
+    .get(replacementFile.hash ?? null, fileId) as { asset_id: string } | undefined;
+  if (duplicateRow) {
+    const duplicate = await getAssetById(duplicateRow.asset_id);
+    if (duplicate) {
+      throw new DuplicateAssetError(duplicate);
+    }
+  }
+
+  await writeFile(getStoredFilePath(replacementFile.storedName), replacement.bytes);
+  try {
+    database
+      .prepare(
+        `
+          UPDATE asset_files SET
+            role = @role, variant = @variant, original_name = @original_name,
+            stored_name = @stored_name, file_type = @file_type, hash = @hash,
+            mime_type = @mime_type, size = @size, category = @category,
+            preview_kind = @preview_kind, width = @width, height = @height,
+            metadata_json = @metadata_json, created_at = @created_at
+          WHERE asset_id = @asset_id AND id = @id
+        `,
+      )
+      .run({
+        id: fileId,
+        asset_id: assetId,
+        role: replacementFile.role,
+        variant: replacementFile.variant,
+        original_name: replacementFile.originalName,
+        stored_name: replacementFile.storedName,
+        file_type: replacementFile.fileType,
+        hash: replacementFile.hash ?? null,
+        mime_type: replacementFile.mimeType,
+        size: replacementFile.size,
+        category: replacementFile.category,
+        preview_kind: replacementFile.previewKind,
+        width: replacementFile.width ?? null,
+        height: replacementFile.height ?? null,
+        metadata_json: JSON.stringify(replacementFile.metadata ?? {}),
+        created_at: replacementFile.createdAt,
+      });
+  } catch (errorValue) {
+    await rm(getStoredFilePath(replacementFile.storedName), { force: true });
+    throw errorValue;
+  }
+  await rm(getStoredFilePath(current.storedName), { force: true });
+  return replacementFile;
+}
+
+export async function listAssetRelations(assetId: string): Promise<AssetRelation[]> {
+  await ensureStorage();
+  const rows = getDb()
+    .prepare(
+      "SELECT parent_asset_id, child_asset_id, relation_type FROM asset_relations WHERE parent_asset_id = ? OR child_asset_id = ? ORDER BY parent_asset_id, child_asset_id",
+    )
+    .all(assetId, assetId) as Array<{
+    parent_asset_id: string;
+    child_asset_id: string;
+    relation_type: string;
+  }>;
+  return rows.map((row) => ({
+    parentAssetId: row.parent_asset_id,
+    childAssetId: row.child_asset_id,
+    relationType:
+      row.relation_type === "variant" || row.relation_type === "derived-from"
+        ? row.relation_type
+        : "contains",
+  }));
+}
+
+export async function addAssetRelation(
+  parentAssetId: string,
+  childAssetId: string,
+  relationType: AssetRelation["relationType"],
+): Promise<boolean> {
+  await ensureStorage();
+  const database = getDb();
+  const assets = database
+    .prepare("SELECT id FROM assets WHERE id IN (?, ?)")
+    .all(parentAssetId, childAssetId) as Array<{ id: string }>;
+  if (assets.length !== 2 || parentAssetId === childAssetId) return false;
+  database
+    .prepare(
+      "INSERT OR IGNORE INTO asset_relations (parent_asset_id, child_asset_id, relation_type) VALUES (?, ?, ?)",
+    )
+    .run(parentAssetId, childAssetId, relationType);
+  return true;
 }
 
 export async function updateAssetMetadata(
@@ -998,7 +1470,9 @@ export async function replaceAssetFile(
       `,
     )
     .get(incomingHash, id) as AssetRow | undefined;
-  const duplicate = duplicateRow ? rowToAssetRecord(duplicateRow) : undefined;
+  const duplicate = duplicateRow
+    ? hydrateAsset(database, rowToAssetRecord(duplicateRow))
+    : undefined;
   if (duplicate) {
     throw new DuplicateAssetError(duplicate);
   }
@@ -1109,10 +1583,48 @@ export async function replaceAssetFile(
         )
         .get(incomingHash, id) as AssetRow | undefined;
       if (existing) {
-        throw new DuplicateAssetError(rowToAssetRecord(existing));
+        throw new DuplicateAssetError(
+          hydrateAsset(database, rowToAssetRecord(existing)),
+        );
       }
     }
     throw errorValue;
+  }
+
+  const primaryFile = database
+    .prepare(
+      "SELECT id FROM asset_files WHERE asset_id = ? ORDER BY created_at ASC, id ASC LIMIT 1",
+    )
+    .get(id) as { id: string } | undefined;
+  if (primaryFile) {
+    database
+      .prepare(
+        `
+          UPDATE asset_files SET
+            original_name = ?, stored_name = ?, file_type = ?, hash = ?,
+            mime_type = ?, size = ?, category = ?, preview_kind = ?,
+            width = ?, height = ?, created_at = ?
+          WHERE id = ? AND asset_id = ?
+        `,
+      )
+      .run(
+        replacement.fileName,
+        storedName,
+        getFileType(
+          replacement.fileName,
+          replacement.mimeType || "application/octet-stream",
+        ),
+        incomingHash,
+        replacement.mimeType || "application/octet-stream",
+        replacement.size,
+        category,
+        previewKind,
+        width ?? null,
+        height ?? null,
+        uploadDate,
+        primaryFile.id,
+        id,
+      );
   }
 
   return getAssetById(id);
@@ -1121,16 +1633,18 @@ export async function replaceAssetFile(
 export async function deleteAsset(id: string): Promise<boolean> {
   await ensureStorage();
   const database = getDb();
-  const row = database
-    .prepare("SELECT stored_name FROM assets WHERE id = ? LIMIT 1")
-    .get(id) as { stored_name: string } | undefined;
+  const rows = database
+    .prepare("SELECT stored_name FROM asset_files WHERE asset_id = ?")
+    .all(id) as Array<{ stored_name: string }>;
 
-  if (!row) {
+  if (rows.length === 0) {
     return false;
   }
 
   database.prepare("DELETE FROM assets WHERE id = ?").run(id);
-  await rm(path.join(uploadsDir, row.stored_name), { force: true });
+  for (const row of rows) {
+    await rm(getStoredFilePath(row.stored_name), { force: true });
+  }
   return true;
 }
 
