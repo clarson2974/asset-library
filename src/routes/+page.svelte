@@ -19,6 +19,8 @@
   import {
     AssetLibraryApiService,
     type AiConfig,
+    type ExternalLibraryConfig,
+    type ExternalLibraryScan,
   } from "$lib/services/asset-library-api";
   import {
     SourceLicensePrefillHelper,
@@ -129,12 +131,16 @@
   let didHydrateFiltersFromUrl = false;
   let aiSettingsOpen = false;
   let aiSaving = false;
+  let externalLibraryOpen = false;
+  let externalLibrarySaving = false;
+  let externalLibraryScanning = false;
   let themeMode: ThemeMode = "dark";
   let uploadInputEl: HTMLInputElement | null = null;
   let replaceInputEl: HTMLInputElement | null = null;
   let showBackToTop = false;
   let editDialogRef: { requestClose: () => void } | null = null;
   let aiDialogRef: { requestClose: () => void } | null = null;
+  let externalLibraryDialogRef: { requestClose: () => void } | null = null;
   let aiConfig = {
     enabled: false,
     baseUrl: "http://127.0.0.1:1234",
@@ -146,6 +152,16 @@
     reasoningEffort: "",
     customInstruction: "",
   };
+  let externalLibraryConfig: ExternalLibraryConfig = {
+    enabled: false,
+    rootDirectory: "",
+    roots: [],
+    ignorePatterns: ["**/.DS_Store", "**/Thumbs.db", "**/*.tmp"],
+    supportedExtensions: [],
+  };
+  let externalLibraryRootsText = "";
+  let externalLibraryExtensionsText = "";
+  let externalLibraryScan: ExternalLibraryScan | null = null;
   const api = new AssetLibraryApiService();
   const sourceLicensePrefillHelper = new SourceLicensePrefillHelper();
   const uploadParallelism = parseUploadParallelism(
@@ -673,6 +689,64 @@
     }
   }
 
+  async function loadExternalLibrary(): Promise<void> {
+    const result = await api.getExternalLibrary();
+    if (!result) return;
+    externalLibraryConfig = result.config;
+    externalLibraryRootsText = result.config.roots.join(", ");
+    externalLibraryExtensionsText = result.config.supportedExtensions.join(", ");
+    externalLibraryScan = result.lastScan;
+  }
+
+  async function saveExternalLibrary(): Promise<void> {
+    externalLibrarySaving = true;
+    try {
+      externalLibraryConfig.roots = externalLibraryRootsText
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+      externalLibraryConfig.supportedExtensions = externalLibraryExtensionsText
+        .split(",")
+        .map((value) => value.trim().toLowerCase())
+        .filter(Boolean);
+      externalLibraryConfig = await api.saveExternalLibrary(externalLibraryConfig);
+      toast.success("External library settings saved.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to save external library settings.");
+    } finally {
+      externalLibrarySaving = false;
+    }
+  }
+
+  async function scanExternalLibrary(): Promise<void> {
+    externalLibraryScanning = true;
+    try {
+      externalLibraryScan = await api.scanExternalLibrary();
+      toast.success("External library scan complete.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to scan external library.");
+    } finally {
+      externalLibraryScanning = false;
+    }
+  }
+
+  async function importExternalLibrary(): Promise<void> {
+    if (!externalLibraryScan) return;
+    externalLibraryScanning = true;
+    try {
+      const paths = externalLibraryScan.discovered
+        .concat(externalLibraryScan.modified)
+        .map((entry) => entry.relativePath);
+      const result = await api.importExternalLibrary(paths);
+      await loadAssets();
+      toast.success(`Imported ${result.imported} file${result.imported === 1 ? "" : "s"}; skipped ${result.skipped} duplicate${result.skipped === 1 ? "" : "s"}.`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to import external library files.");
+    } finally {
+      externalLibraryScanning = false;
+    }
+  }
+
   function onDrop(event: DragEvent): void {
     event.preventDefault();
     event.stopPropagation();
@@ -870,6 +944,14 @@
     aiSettingsOpen = false;
   }
 
+  function closeExternalLibraryDialog(): void {
+    if (externalLibraryDialogRef) {
+      externalLibraryDialogRef.requestClose();
+      return;
+    }
+    externalLibraryOpen = false;
+  }
+
   function onWindowKeyDown(event: KeyboardEvent): void {
     if (event.key === "Escape" && editingAssetId) {
       closeEditDialog();
@@ -963,6 +1045,7 @@
 
   onMount(loadAssets);
   onMount(loadAiConfig);
+  onMount(loadExternalLibrary);
   onMount(initializeTheme);
   onMount(onWindowScroll);
   onMount(() => {
@@ -1062,6 +1145,11 @@
         />
         AI</Button
       >
+
+      <Button onclick={() => (externalLibraryOpen = true)}>
+        <Icon icon="mdi:folder-network-outline" width="1rem" height="1rem" aria-hidden="true" />
+        Libraries
+      </Button>
 
       <input
         bind:this={uploadInputEl}
@@ -1338,6 +1426,69 @@
           {aiSaving ? "Saving..." : "Save"}
         </Button>
         <Button onclick={closeAiDialog}>Cancel</Button>
+      {/snippet}
+    </Dialog>
+  {/if}
+
+  {#if externalLibraryOpen}
+    <Dialog
+      bind:this={externalLibraryDialogRef}
+      ariaLabel="External library settings"
+      title="External Library"
+      onClose={() => {
+        externalLibraryOpen = false;
+      }}
+    >
+      <p class="assetlib-muted">
+        Scan an existing read-only folder without copying its files into uploads.
+        Subfolders are relative to the configured root.
+      </p>
+
+      <label class="assetlib-toggle">
+        <input type="checkbox" bind:checked={externalLibraryConfig.enabled} />
+        <span>Enable external scanning</span>
+      </label>
+
+      <label class="assetlib-modal-label">
+        <span>Root directory</span>
+        <Input bind:value={externalLibraryConfig.rootDirectory} placeholder="D:\\GameAssets" />
+      </label>
+
+      <label class="assetlib-modal-label">
+        <span>Relative folders (comma-separated)</span>
+        <Input
+          bind:value={externalLibraryRootsText}
+          placeholder="Models, Textures"
+        />
+      </label>
+
+      <label class="assetlib-modal-label">
+        <span>Supported extensions (comma-separated)</span>
+        <Input
+          bind:value={externalLibraryExtensionsText}
+          placeholder=".glb, .png, .wav"
+        />
+      </label>
+
+      {#if externalLibraryScan}
+        <p class="assetlib-muted">
+          Last scan: {externalLibraryScan.status}. New {externalLibraryScan.discovered.length},
+          modified {externalLibraryScan.modified.length}, missing {externalLibraryScan.missing.length},
+          unavailable {externalLibraryScan.unavailable.length}.
+        </p>
+      {/if}
+
+      {#snippet actions()}
+        <Button onclick={importExternalLibrary} disabled={!externalLibraryScan || externalLibraryScanning || externalLibrarySaving}>
+          {externalLibraryScanning ? "Importing..." : "Import discovered"}
+        </Button>
+        <Button onclick={scanExternalLibrary} disabled={externalLibraryScanning || externalLibrarySaving}>
+          {externalLibraryScanning ? "Scanning..." : "Scan now"}
+        </Button>
+        <Button variant="emphasized" onclick={saveExternalLibrary} disabled={externalLibrarySaving || externalLibraryScanning}>
+          {externalLibrarySaving ? "Saving..." : "Save"}
+        </Button>
+        <Button onclick={closeExternalLibraryDialog} disabled={externalLibrarySaving || externalLibraryScanning}>Cancel</Button>
       {/snippet}
     </Dialog>
   {/if}

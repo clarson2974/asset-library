@@ -1,5 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { DuplicateAssetError, saveAsset } from "$lib/server/assets";
 
 export type ExternalLibraryScanStatus = "ok" | "warning" | "error";
 
@@ -173,7 +175,9 @@ function writeStateFile(nextState: ExternalLibraryScanStateFile): void {
 function normalizeConfigInput(input: Partial<ExternalLibraryConfig>): Partial<ExternalLibraryConfig> {
   const next: Partial<ExternalLibraryConfig> = { ...input };
   if (Array.isArray(input.roots)) {
-    next.roots = input.roots.map((root) => root.trim()).filter(Boolean);
+    next.roots = input.roots
+      .map((root) => root.trim())
+      .filter((root) => root && !path.isAbsolute(root));
   }
   if (Array.isArray(input.ignorePatterns)) {
     next.ignorePatterns = input.ignorePatterns.map((entry) => entry.trim()).filter(Boolean);
@@ -250,10 +254,14 @@ function ensureNoSymlinkEscape(baseDirectory: string, candidatePath: string): st
   for (const segment of relativeSegments) {
     current = path.join(current, segment);
     try {
-      if (lstatSync(current).isSymbolicLink()) {
+      const stats = lstatSync(current);
+      if (stats.isSymbolicLink()) {
         throw new Error(`Symlink escape detected in ${candidatePath}`);
       }
-    } catch {
+    } catch (errorValue) {
+      if (errorValue instanceof Error && errorValue.message.startsWith("Symlink escape detected")) {
+        throw errorValue;
+      }
       // Nonexistent path segments are acceptable here; they are still under the root.
     }
   }
@@ -492,4 +500,65 @@ export async function scanExternalLibraries(): Promise<ExternalLibraryScanResult
 export async function getExternalLibraryScanState(): Promise<ExternalLibraryScanStateFile> {
   const state = readStateFile();
   return state;
+}
+
+function mimeTypeForPath(filePath: string): string {
+  const mimeTypes: Record<string, string> = {
+    ".glb": "model/gltf-binary",
+    ".gltf": "model/gltf+json",
+    ".obj": "model/obj",
+    ".fbx": "application/octet-stream",
+    ".blend": "application/octet-stream",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".json": "application/json",
+  };
+  return mimeTypes[path.extname(filePath).toLowerCase()] ?? "application/octet-stream";
+}
+
+export async function importExternalLibraryEntries(relativePaths: string[]): Promise<{
+  imported: number;
+  skipped: number;
+}> {
+  const config = await getExternalLibraryConfig();
+  const state = readStateFile();
+  const entries = (state.lastScan?.discovered ?? []).concat(state.lastScan?.modified ?? []);
+  const requested = new Set(relativePaths);
+  let imported = 0;
+  let skipped = 0;
+
+  for (const entry of entries) {
+    if (!requested.has(entry.relativePath)) continue;
+
+    try {
+      const safePath = ensureNoSymlinkEscape(config.rootDirectory, entry.fullPath);
+      const bytes = new Uint8Array(await readFile(safePath));
+      await saveAsset({
+        title: path.basename(entry.relativePath, path.extname(entry.relativePath)),
+        tags: [],
+        licenses: ["Unknown"],
+        fileName: path.basename(entry.fullPath),
+        mimeType: mimeTypeForPath(entry.fullPath),
+        size: bytes.byteLength,
+        bytes,
+      });
+      imported += 1;
+    } catch (errorValue) {
+      if (errorValue instanceof DuplicateAssetError) {
+        skipped += 1;
+        continue;
+      }
+      throw errorValue;
+    }
+  }
+
+  return { imported, skipped };
 }

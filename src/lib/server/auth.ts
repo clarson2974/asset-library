@@ -257,6 +257,7 @@ export async function loginWithCredentials(params: {
   email: string;
   password: string;
 }): Promise<LoginResult> {
+  await ensureAdminUser();
   const database = getDataDb();
   const normalizedEmail = normalizeEmail(params.email);
   const userRow = database

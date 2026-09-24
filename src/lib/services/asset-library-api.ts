@@ -19,6 +19,34 @@ export type AiConfig = {
   customInstruction: string;
 };
 
+export type ExternalLibraryConfig = {
+  enabled: boolean;
+  rootDirectory: string;
+  roots: string[];
+  ignorePatterns: string[];
+  supportedExtensions: string[];
+};
+
+export type ExternalLibraryEntry = {
+  relativePath: string;
+  fullPath: string;
+  size: number;
+  lastModified: string;
+  status: "discovered" | "modified" | "missing" | "ignored" | "unavailable";
+  reason?: string;
+};
+
+export type ExternalLibraryScan = {
+  status: "ok" | "warning" | "error";
+  scannedAt: string;
+  rootDirectory: string;
+  discovered: ExternalLibraryEntry[];
+  modified: ExternalLibraryEntry[];
+  missing: ExternalLibraryEntry[];
+  ignored: ExternalLibraryEntry[];
+  unavailable: ExternalLibraryEntry[];
+};
+
 export type AssetUpdatePayload = {
   title: string;
   description: string;
@@ -130,6 +158,58 @@ export class AssetLibraryApiService {
     }
 
     return payload.config;
+  }
+
+  async getExternalLibrary(): Promise<{
+    config: ExternalLibraryConfig;
+    lastScan: ExternalLibraryScan | null;
+  } | null> {
+    const response = await fetch("/api/integrations/external-library");
+    if (!response.ok) return null;
+    return (await response.json()) as {
+      config: ExternalLibraryConfig;
+      lastScan: ExternalLibraryScan | null;
+    };
+  }
+
+  async saveExternalLibrary(
+    config: ExternalLibraryConfig,
+  ): Promise<ExternalLibraryConfig> {
+    const response = await fetch("/api/integrations/external-library", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(config),
+    });
+    const payload = (await response.json()) as { config?: ExternalLibraryConfig; error?: string };
+    if (!response.ok || !payload.config) {
+      throw new Error(payload.error || "Failed to save external library settings.");
+    }
+    return payload.config;
+  }
+
+  async scanExternalLibrary(): Promise<ExternalLibraryScan> {
+    const response = await fetch("/api/integrations/external-library", { method: "POST" });
+    const payload = (await response.json()) as { scan?: ExternalLibraryScan; error?: string };
+    if (!response.ok || !payload.scan) {
+      throw new Error(payload.error || "Failed to scan external library.");
+    }
+    return payload.scan;
+  }
+
+  async importExternalLibrary(paths: string[]): Promise<{ imported: number; skipped: number }> {
+    const response = await fetch("/api/integrations/external-library", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "import", paths }),
+    });
+    const payload = (await response.json()) as {
+      result?: { imported: number; skipped: number };
+      error?: string;
+    };
+    if (!response.ok || !payload.result) {
+      throw new Error(payload.error || "Failed to import external library files.");
+    }
+    return payload.result;
   }
 
   async replaceAssetFile(
