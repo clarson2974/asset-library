@@ -16,6 +16,13 @@ export type AssetFileRole =
   | "document"
   | "other";
 
+export type AssetFileMetadataKind =
+  | "audio"
+  | "texture"
+  | "model"
+  | "text"
+  | "other";
+
 export interface AssetFileRecord {
   id: string;
   assetId: string;

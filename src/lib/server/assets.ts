@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { TextDecoder } from "node:util";
 import type {
   AssetCategory,
+  AssetFileMetadataKind,
   AssetFileRecord,
   AssetFileRole,
   AssetPreviewKind,
@@ -824,6 +825,158 @@ function getAudioAttachmentFormat(
   return undefined;
 }
 
+export function detectPbrTextureSet(fileName: string): {
+  kind: string;
+  value: string;
+} | null {
+  const normalized = fileName.toLowerCase();
+  const tokens = normalized
+    .replace(/\.[^.]+$/, "")
+    .replace(/[_-]+/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const joined = tokens.join(" ");
+  const patterns: Array<[string | RegExp, string]> = [
+    [/basecolor|albedo|color|diffuse/, "baseColor"],
+    [/normal|bump/, "normal"],
+    [/orm|rma|occlusion.*roughness.*metallic|roughness.*metallic.*ao/, "orm"],
+    [/roughness/, "roughness"],
+    [/metallic/, "metallic"],
+    [/ao|ambientocclusion/, "ao"],
+    [/emissive|glow/, "emissive"],
+    [/opacity|alpha/, "opacity"],
+    [/height|displacement|bumpheight/, "height"],
+  ];
+
+  for (const [pattern, kind] of patterns) {
+    if (pattern instanceof RegExp ? pattern.test(joined) : joined.includes(pattern)) {
+      return { kind, value: kind };
+    }
+  }
+
+  return null;
+}
+
+export function extractAssetFileMetadata(params: {
+  fileName: string;
+  mimeType: string;
+  bytes: Uint8Array;
+  category?: AssetCategory;
+}): Record<string, unknown> {
+  const category = params.category ?? getCategory(params.fileName, params.mimeType);
+  const fallbackKind: AssetFileMetadataKind =
+    category === "audio"
+      ? "audio"
+      : category === "texture"
+        ? "texture"
+        : category === "model"
+          ? "model"
+          : category === "shader" || category === "script"
+            ? "text"
+            : "other";
+
+  const metadata: Record<string, unknown> = {
+    kind: fallbackKind,
+    format: getFileType(params.fileName, params.mimeType),
+  };
+
+  if (category === "texture" || params.mimeType.startsWith("image/")) {
+    const pbr = detectPbrTextureSet(params.fileName);
+    if (pbr) {
+      metadata.pbrTextureSet = pbr.kind;
+      metadata.pbrTextureSetLabel = pbr.value;
+    }
+
+    return metadata;
+  }
+
+  if (category === "audio" || params.mimeType.startsWith("audio/")) {
+    metadata.kind = "audio";
+    const wavHeader = parseWavHeader(params.bytes);
+    if (wavHeader) {
+      Object.assign(metadata, wavHeader);
+    }
+    return metadata;
+  }
+
+  if (category === "model" || params.mimeType.startsWith("model/")) {
+    metadata.kind = "model";
+    metadata.fileFormat = getFileType(params.fileName, params.mimeType);
+    metadata.hasRig = /\.(gltf|glb|fbx|blend)$/i.test(params.fileName);
+    return metadata;
+  }
+
+  if (category === "shader" || category === "script") {
+    metadata.kind = "text";
+  }
+
+  return metadata;
+}
+
+function parseWavHeader(bytes: Uint8Array): Record<string, unknown> | null {
+  if (bytes.length < 12) return null;
+  const riff = new TextDecoder().decode(bytes.slice(0, 4));
+  const wave = new TextDecoder().decode(bytes.slice(8, 12));
+  if (riff !== "RIFF" || wave !== "WAVE") return null;
+
+  let offset = 12;
+  while (offset + 8 <= bytes.length) {
+    const chunkId = new TextDecoder().decode(bytes.slice(offset, offset + 4));
+    const chunkSize = bytes[offset + 4] |
+      (bytes[offset + 5] << 8) |
+      (bytes[offset + 6] << 16) |
+      (bytes[offset + 7] << 24);
+    const dataOffset = offset + 8;
+    if (chunkId === "fmt ") {
+      if (dataOffset + 16 > bytes.length) return null;
+      const audioFormat = bytes[dataOffset] | (bytes[dataOffset + 1] << 8);
+      const channels = bytes[dataOffset + 2] | (bytes[dataOffset + 3] << 8);
+      const sampleRate = bytes[dataOffset + 4] |
+        (bytes[dataOffset + 5] << 8) |
+        (bytes[dataOffset + 6] << 16) |
+        (bytes[dataOffset + 7] << 24);
+      const bitDepth = bytes[dataOffset + 14] | (bytes[dataOffset + 15] << 8);
+      const output: Record<string, unknown> = {
+        format: "wav",
+        audioFormat,
+        channels,
+        sampleRate,
+        bitDepth,
+      };
+
+      let dataSize = 0;
+      let foundData = false;
+      let cursor = 12;
+      while (cursor + 8 <= bytes.length) {
+        const currentId = new TextDecoder().decode(bytes.slice(cursor, cursor + 4));
+        const currentSize = bytes[cursor + 4] |
+          (bytes[cursor + 5] << 8) |
+          (bytes[cursor + 6] << 16) |
+          (bytes[cursor + 7] << 24);
+        const currentOffset = cursor + 8;
+        if (currentId === "data") {
+          foundData = true;
+          dataSize = currentSize;
+          break;
+        }
+        cursor += 8 + currentSize + (currentSize % 2);
+      }
+
+      if (foundData && sampleRate > 0 && channels > 0 && bitDepth > 0) {
+        output.durationSeconds = Number(
+          ((dataSize / (sampleRate * channels * (bitDepth / 8))) || 0).toFixed(3),
+        );
+      }
+      return output;
+    }
+
+    offset += 8 + chunkSize + (chunkSize % 2);
+  }
+
+  return null;
+}
+
 function getFileType(fileName: string, mimeType: string): string {
   const ext = path.extname(fileName).toLowerCase();
   if (ext.startsWith(".") && ext.length > 1) {
@@ -1008,6 +1161,13 @@ export async function saveAsset(params: {
         : undefined,
   });
 
+  const fileMetadata = extractAssetFileMetadata({
+    fileName: params.fileName,
+    mimeType: params.mimeType || "application/octet-stream",
+    bytes: params.bytes,
+    category,
+  });
+
   const normalizedLicenses = (params.licenses ?? [])
     .map((license) => license.trim())
     .filter(Boolean);
@@ -1056,6 +1216,7 @@ export async function saveAsset(params: {
     previewKind: record.previewKind,
     width: record.width,
     height: record.height,
+    metadata: fileMetadata,
     createdAt: record.uploadDate,
   };
 
@@ -1199,6 +1360,14 @@ async function buildAssetFile(
   }
 
   const fileId = randomUUID();
+  const metadata = input.metadata ??
+    extractAssetFileMetadata({
+      fileName: input.fileName,
+      mimeType,
+      bytes: input.bytes,
+      category,
+    });
+
   return {
     id: fileId,
     assetId,
@@ -1214,7 +1383,7 @@ async function buildAssetFile(
     previewKind,
     width,
     height,
-    metadata: input.metadata,
+    metadata,
     createdAt: new Date().toISOString(),
   };
 }
@@ -1274,7 +1443,9 @@ export async function replaceAssetChildFile(
     }
   }
 
-  await writeFile(getStoredFilePath(replacementFile.storedName), replacement.bytes);
+  const replacementPath = getStoredFilePath(replacementFile.storedName);
+  const currentPath = getStoredFilePath(current.storedName);
+  await writeFile(replacementPath, replacement.bytes);
   try {
     database
       .prepare(
@@ -1307,10 +1478,13 @@ export async function replaceAssetChildFile(
         created_at: replacementFile.createdAt,
       });
   } catch (errorValue) {
-    await rm(getStoredFilePath(replacementFile.storedName), { force: true });
+    await rm(replacementPath, { force: true });
     throw errorValue;
   }
-  await rm(getStoredFilePath(current.storedName), { force: true });
+
+  if (replacementFile.storedName !== current.storedName) {
+    await rm(currentPath, { force: true });
+  }
   return replacementFile;
 }
 
@@ -1506,10 +1680,9 @@ export async function replaceAssetFile(
     }
   }
 
-  await writeFile(path.join(uploadsDir, storedName), replacement.bytes);
-  if (storedName !== current.storedName) {
-    await rm(path.join(uploadsDir, current.storedName), { force: true });
-  }
+  const replacementPath = path.join(uploadsDir, storedName);
+  const currentPath = path.join(uploadsDir, current.storedName);
+  await writeFile(replacementPath, replacement.bytes);
 
   const uploadDate = new Date().toISOString();
   try {
@@ -1551,6 +1724,7 @@ export async function replaceAssetFile(
         upload_date: uploadDate,
       });
   } catch (errorValue) {
+    await rm(replacementPath, { force: true });
     const message =
       errorValue instanceof Error ? errorValue.message : String(errorValue);
     if (message.includes("UNIQUE constraint failed: assets.hash")) {
@@ -1603,7 +1777,7 @@ export async function replaceAssetFile(
           UPDATE asset_files SET
             original_name = ?, stored_name = ?, file_type = ?, hash = ?,
             mime_type = ?, size = ?, category = ?, preview_kind = ?,
-            width = ?, height = ?, created_at = ?
+            width = ?, height = ?, created_at = ?, metadata_json = ?
           WHERE id = ? AND asset_id = ?
         `,
       )
@@ -1622,9 +1796,21 @@ export async function replaceAssetFile(
         width ?? null,
         height ?? null,
         uploadDate,
+        JSON.stringify(
+          extractAssetFileMetadata({
+            fileName: replacement.fileName,
+            mimeType: replacement.mimeType || "application/octet-stream",
+            bytes: replacement.bytes,
+            category,
+          }),
+        ),
         primaryFile.id,
         id,
       );
+  }
+
+  if (storedName !== current.storedName) {
+    await rm(currentPath, { force: true });
   }
 
   return getAssetById(id);

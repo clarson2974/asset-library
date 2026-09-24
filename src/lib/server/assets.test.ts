@@ -38,6 +38,52 @@ afterEach(async () => {
 });
 
 describe("asset storage", () => {
+  it("detects PBR texture sets and extracts file metadata", async () => {
+    const assets = await loadAssetsModule();
+
+    expect(assets.detectPbrTextureSet("Hero_BaseColor.png")).toMatchObject({
+      kind: "baseColor",
+    });
+    expect(assets.detectPbrTextureSet("Hero_Normal.png")).toMatchObject({
+      kind: "normal",
+    });
+    expect(assets.detectPbrTextureSet("Hero_ORM.png")).toMatchObject({
+      kind: "orm",
+    });
+
+    const wavBytes = new Uint8Array([
+      0x52, 0x49, 0x46, 0x46, // RIFF
+      0x28, 0x00, 0x00, 0x00, // file size (40 bytes payload)
+      0x57, 0x41, 0x56, 0x45, // WAVE
+      0x66, 0x6d, 0x74, 0x20, // fmt
+      0x10, 0x00, 0x00, 0x00, // chunk size
+      0x01, 0x00, // PCM
+      0x02, 0x00, // stereo
+      0x44, 0xac, 0x00, 0x00, // sample rate 44100
+      0x88, 0x58, 0x01, 0x00, // byte rate 176400
+      0x02, 0x00, // block align
+      0x10, 0x00, // bits per sample = 16
+      0x64, 0x61, 0x74, 0x61, // data
+      0x08, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+    ]);
+
+    const metadata = assets.extractAssetFileMetadata({
+      fileName: "sfx.wav",
+      mimeType: "audio/wav",
+      bytes: wavBytes,
+      category: "audio",
+    });
+
+    expect(metadata).toMatchObject({
+      kind: "audio",
+      format: "wav",
+      sampleRate: 44100,
+      channels: 2,
+      bitDepth: 16,
+    });
+  });
+
   it("saves an asset and reads its file from isolated storage", async () => {
     const assets = await loadAssetsModule();
     const record = await assets.saveAsset({
