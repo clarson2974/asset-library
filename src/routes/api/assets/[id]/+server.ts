@@ -1,6 +1,7 @@
 import { json, type RequestHandler } from "@sveltejs/kit";
 import {
   deleteAsset,
+  setAssetDeleted,
   toAssetView,
   updateAssetMetadata,
 } from "$lib/server/assets";
@@ -81,7 +82,7 @@ export const PATCH: RequestHandler = async ({ locals, params, request }) => {
   return json({ asset: toAssetView(record) });
 };
 
-export const DELETE: RequestHandler = async ({ locals, params }) => {
+export const DELETE: RequestHandler = async ({ locals, params, url }) => {
   if (!(await requireUserCapability(locals.user, "asset.delete"))) {
     return json({ error: "Forbidden." }, { status: 403 });
   }
@@ -90,10 +91,12 @@ export const DELETE: RequestHandler = async ({ locals, params }) => {
     return json({ error: "Missing asset id." }, { status: 400 });
   }
 
-  const deleted = await deleteAsset(params.id);
+  const deleted = url.searchParams.get("permanent") === "1"
+    ? await deleteAsset(params.id)
+    : await setAssetDeleted(params.id, true);
   if (!deleted) {
     return json({ error: "Asset not found." }, { status: 404 });
   }
 
-  return json({ ok: true });
+  return json({ ok: true, softDeleted: url.searchParams.get("permanent") !== "1" });
 };

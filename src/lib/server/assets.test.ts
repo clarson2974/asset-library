@@ -101,6 +101,37 @@ describe("asset storage", () => {
     );
   });
 
+  it("searches and paginates the catalog without returning soft-deleted assets", async () => {
+    const assets = await loadAssetsModule();
+    await assets.saveAsset({
+      title: "Forest oak tree",
+      description: "A detailed environment prop",
+      tags: ["nature"],
+      fileName: "oak.txt",
+      mimeType: "text/plain",
+      size: 3,
+      bytes: new TextEncoder().encode("oak"),
+    });
+    const second = await assets.saveAsset({
+      title: "Stone wall",
+      tags: ["architecture"],
+      fileName: "wall.txt",
+      mimeType: "text/plain",
+      size: 4,
+      bytes: new TextEncoder().encode("wall"),
+    });
+
+    await expect(assets.searchAssets({ query: "oak", pageSize: 1 })).resolves.toMatchObject({
+      total: 1,
+      assets: [{ title: "Forest oak tree" }],
+    });
+    await assets.setAssetDeleted(second.id, true);
+    await expect(assets.searchAssets({ pageSize: 1 })).resolves.toMatchObject({
+      total: 1,
+      totalPages: 1,
+    });
+  });
+
   it("supports multiple files and replaces only the selected child file", async () => {
     const assets = await loadAssetsModule();
     const record = await assets.saveAsset({

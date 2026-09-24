@@ -91,6 +91,27 @@ type AssetRow = {
   preview_kind: string;
   width: number | null;
   height: number | null;
+  deleted_at?: string | null;
+};
+
+export type AssetSearchOptions = {
+  query?: string;
+  page?: number;
+  pageSize?: number;
+  categories?: string[];
+  tags?: string[];
+  licenses?: string[];
+  todoOnly?: boolean;
+  sort?: "best-match" | "newest" | "oldest" | "title-asc" | "size-desc" | "needs-metadata";
+  includeDeleted?: boolean;
+};
+
+export type AssetSearchResult = {
+  assets: AssetRecord[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
 };
 
 type AssetFileRow = {
@@ -243,6 +264,35 @@ const migrations: MigrationDefinition[] = [
           row.height,
           row.upload_date,
         );
+      }
+    },
+  },
+  {
+    id: "004_search_jobs_and_soft_delete",
+    description: "Add catalog search indexing and reversible soft deletion.",
+    run(database) {
+      const columns = database.prepare("PRAGMA table_info(assets)").all() as Array<{ name: string }>;
+      if (!columns.some((column) => column.name === "deleted_at")) {
+        database.exec("ALTER TABLE assets ADD COLUMN deleted_at TEXT");
+      }
+      database.exec("CREATE INDEX IF NOT EXISTS idx_assets_deleted_upload ON assets(deleted_at, upload_date DESC)");
+      database.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS assets_search USING fts5(
+          asset_id UNINDEXED,
+          title,
+          description,
+          tags,
+          licenses,
+          original_name,
+          category,
+          file_type
+        );
+      `);
+      database.exec("DELETE FROM assets_search");
+      const rows = database.prepare("SELECT id, title, description, tags_json, licenses_json, original_name, category, file_type FROM assets").all() as Array<Record<string, string>>;
+      const insert = database.prepare("INSERT INTO assets_search (asset_id, title, description, tags, licenses, original_name, category, file_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const row of rows) {
+        insert.run(row.id, row.title, row.description, row.tags_json, row.licenses_json, row.original_name, row.category, row.file_type);
       }
     },
   },
@@ -576,6 +626,22 @@ function getAssetFiles(database: DatabaseSync, assetId: string): AssetFileRecord
 
 function hydrateAsset(database: DatabaseSync, record: AssetRecord): AssetRecord {
   return { ...record, files: getAssetFiles(database, record.id) };
+}
+
+function indexAsset(database: DatabaseSync, record: AssetRecord): void {
+  database.prepare("DELETE FROM assets_search WHERE asset_id = ?").run(record.id);
+  database.prepare(
+    "INSERT INTO assets_search (asset_id, title, description, tags, licenses, original_name, category, file_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  ).run(
+    record.id,
+    record.title,
+    record.description,
+    record.tags.join(" "),
+    record.licenses.join(" "),
+    record.originalName,
+    record.category,
+    record.fileType,
+  );
 }
 
 function insertRecord(database: DatabaseSync, record: AssetRecord): void {
@@ -995,37 +1061,82 @@ function getFileType(fileName: string, mimeType: string): string {
 }
 
 export async function readAssets(): Promise<AssetRecord[]> {
+  return (await searchAssets({ page: 1, pageSize: 100000 })).assets;
+}
+
+function buildSearchMatch(query: string): string {
+  return query
+    .split(/[^\p{L}\p{N}_-]+/u)
+    .map((term) => term.trim().replace(/"/g, ""))
+    .filter(Boolean)
+    .map((term) => `"${term}"*`)
+    .join(" AND ");
+}
+
+export async function searchAssets(options: AssetSearchOptions = {}): Promise<AssetSearchResult> {
   await ensureStorage();
   const database = getDb();
-  const rows = database
-    .prepare(
-      `
-        SELECT
-          id,
-          title,
-          description,
-          tags_json,
-          licenses_json,
-          source_url,
-          metadata_edited,
-          upload_date,
-          original_name,
-          stored_name,
-          file_type,
-          hash,
-          mime_type,
-          size,
-          category,
-          preview_kind,
-          width,
-          height
-        FROM assets
-        ORDER BY upload_date DESC
-      `,
-    )
-    .all() as AssetRow[];
+  const page = Math.max(1, Math.floor(options.page ?? 1));
+  const pageSize = Math.min(100, Math.max(1, Math.floor(options.pageSize ?? 40)));
+  const where: string[] = [];
+  const values: Array<string | number> = [];
+  if (!options.includeDeleted) where.push("a.deleted_at IS NULL");
+  if (options.todoOnly) where.push("a.metadata_edited = 0");
+  if (options.categories?.length) {
+    where.push(`a.category IN (${options.categories.map(() => "?").join(",")})`);
+    values.push(...options.categories);
+  }
+  for (const tag of options.tags ?? []) {
+    where.push("EXISTS (SELECT 1 FROM json_each(a.tags_json) WHERE lower(value) = lower(?))");
+    values.push(tag);
+  }
+  for (const license of options.licenses ?? []) {
+    where.push("EXISTS (SELECT 1 FROM json_each(a.licenses_json) WHERE lower(value) = lower(?))");
+    values.push(license);
+  }
+  const match = options.query ? buildSearchMatch(options.query) : "";
+  if (match) {
+    where.push("s.assets_search MATCH ?");
+    values.push(match);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const orderBy = match && (options.sort ?? "best-match") === "best-match"
+    ? "bm25(s.assets_search), a.upload_date DESC"
+    : ({
+        newest: "a.upload_date DESC",
+        oldest: "a.upload_date ASC",
+        "title-asc": "lower(a.title) ASC, a.id ASC",
+        "size-desc": "a.size DESC, a.id ASC",
+        "needs-metadata": "a.metadata_edited ASC, a.upload_date DESC",
+        "best-match": "a.upload_date DESC",
+      }[options.sort ?? "best-match"] ?? "a.upload_date DESC");
+  const count = database.prepare(`SELECT COUNT(*) AS count FROM assets a ${match ? "JOIN assets_search s ON s.asset_id = a.id" : ""} ${whereSql}`).get(...values) as { count: number };
+  const rows = database.prepare(`
+    SELECT a.id, a.title, a.description, a.tags_json, a.licenses_json, a.source_url,
+      a.metadata_edited, a.upload_date, a.original_name, a.stored_name, a.file_type,
+      a.hash, a.mime_type, a.size, a.category, a.preview_kind, a.width, a.height
+    FROM assets a
+    ${match ? "JOIN assets_search s ON s.asset_id = a.id" : ""}
+    ${whereSql}
+    ORDER BY ${orderBy}
+    LIMIT ? OFFSET ?
+  `).all(...values, pageSize, (page - 1) * pageSize) as AssetRow[];
+  return {
+    assets: rows.map((row) => hydrateAsset(database, rowToAssetRecord(row))),
+    page,
+    pageSize,
+    total: Number(count.count),
+    totalPages: Math.max(1, Math.ceil(Number(count.count) / pageSize)),
+  };
+}
 
-  return rows.map((row) => hydrateAsset(database, rowToAssetRecord(row)));
+export async function setAssetDeleted(id: string, deleted: boolean): Promise<boolean> {
+  await ensureStorage();
+  const result = getDb().prepare("UPDATE assets SET deleted_at = ? WHERE id = ?").run(
+    deleted ? new Date().toISOString() : null,
+    id,
+  );
+  return Number(result.changes) > 0;
 }
 
 export function toAssetView(record: AssetRecord): AssetView {
@@ -1225,6 +1336,7 @@ export async function saveAsset(params: {
   try {
     insertRecord(database, record);
     insertAssetFile(database, file);
+    indexAsset(database, record);
   } catch (errorValue) {
     await rm(path.join(uploadsDir, storedName), { force: true });
 
@@ -1567,7 +1679,9 @@ export async function updateAssetMetadata(
     return undefined;
   }
 
-  return getAssetById(id);
+  const updated = await getAssetById(id);
+  if (updated) indexAsset(database, updated);
+  return updated;
 }
 
 export async function replaceAssetFile(

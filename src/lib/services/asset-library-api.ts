@@ -32,15 +32,26 @@ export type ApiErrorPayload = {
   duplicate?: boolean;
 };
 
+export type AssetListPage = {
+  assets: AssetView[];
+  pagination: { page: number; pageSize: number; total: number; totalPages: number };
+};
+
 export class AssetLibraryApiService {
   async listAssets(): Promise<AssetView[]> {
-    const response = await fetch("/api/assets");
+    const response = await fetch("/api/assets?page=1&pageSize=40");
     if (!response.ok) {
       throw new Error("Failed to load assets.");
     }
 
     const payload = (await response.json()) as { assets: AssetView[] };
     return payload.assets;
+  }
+
+  async listAssetsPage(page: number): Promise<AssetListPage> {
+    const response = await fetch(`/api/assets?page=${page}&pageSize=40`);
+    if (!response.ok) throw new Error("Failed to load assets.");
+    return (await response.json()) as AssetListPage;
   }
 
   async uploadAsset(

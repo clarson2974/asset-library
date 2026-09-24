@@ -1,7 +1,7 @@
 import { json, type RequestHandler } from "@sveltejs/kit";
 import {
   DuplicateAssetError,
-  readAssets,
+  searchAssets,
   saveAsset,
   toAssetView,
 } from "$lib/server/assets";
@@ -14,13 +14,29 @@ function parseTags(input: string): string[] {
     .filter(Boolean);
 }
 
-export const GET: RequestHandler = async ({ locals }) => {
+export const GET: RequestHandler = async ({ locals, url }) => {
   if (!(await requireUserCapability(locals.user, "asset.read"))) {
     return json({ error: "Forbidden." }, { status: 403 });
   }
 
-  const assets = await readAssets();
-  return json({ assets: assets.map(toAssetView) });
+  const csv = (key: string) => url.searchParams.getAll(key).flatMap((value) => value.split(",")).map((value) => value.trim()).filter(Boolean);
+  const sort = url.searchParams.get("sort");
+  const validSort = ["best-match", "newest", "oldest", "title-asc", "size-desc", "needs-metadata"] as const;
+  const result = await searchAssets({
+    query: url.searchParams.get("q") ?? undefined,
+    page: Number(url.searchParams.get("page") ?? 1),
+    pageSize: Number(url.searchParams.get("pageSize") ?? 40),
+    categories: csv("category"),
+    tags: csv("tag"),
+    licenses: csv("license"),
+    todoOnly: url.searchParams.get("todo") === "1",
+    includeDeleted: url.searchParams.get("includeDeleted") === "1",
+    sort: validSort.includes(sort as (typeof validSort)[number]) ? sort as (typeof validSort)[number] : "best-match",
+  });
+  return json({
+    assets: result.assets.map(toAssetView),
+    pagination: { page: result.page, pageSize: result.pageSize, total: result.total, totalPages: result.totalPages },
+  });
 };
 
 export const POST: RequestHandler = async ({ locals, request }) => {

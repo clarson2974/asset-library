@@ -92,6 +92,9 @@
 
   let assets: AssetView[] = [];
   let loading = true;
+  let loadingMore = false;
+  let assetPage = 1;
+  let assetTotalPages = 1;
 
   let isDragging = false;
   let pageDragDepth = 0;
@@ -614,13 +617,31 @@
   async function loadAssets(): Promise<void> {
     loading = true;
     try {
-      assets = await api.listAssets();
+      const result = await api.listAssetsPage(1);
+      assets = result.assets;
+      assetPage = result.pagination.page;
+      assetTotalPages = result.pagination.totalPages;
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Failed to load assets.",
       );
     } finally {
       loading = false;
+    }
+  }
+
+  async function loadMoreAssets(): Promise<void> {
+    if (loadingMore || assetPage >= assetTotalPages) return;
+    loadingMore = true;
+    try {
+      const result = await api.listAssetsPage(assetPage + 1);
+      assets = [...assets, ...result.assets];
+      assetPage = result.pagination.page;
+      assetTotalPages = result.pagination.totalPages;
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to load more assets.");
+    } finally {
+      loadingMore = false;
     }
   }
 
@@ -1115,6 +1136,13 @@
               />
             {/each}
           </div>
+          {#if assetPage < assetTotalPages}
+            <div class="assetlib-load-more">
+              <Button onclick={loadMoreAssets} disabled={loadingMore}>
+                {loadingMore ? "Loading..." : "Load more assets"}
+              </Button>
+            </div>
+          {/if}
         {/if}
       </div>
     </div>
