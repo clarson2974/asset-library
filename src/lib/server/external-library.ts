@@ -524,41 +524,95 @@ function mimeTypeForPath(filePath: string): string {
   return mimeTypes[path.extname(filePath).toLowerCase()] ?? "application/octet-stream";
 }
 
-export async function importExternalLibraryEntries(relativePaths: string[]): Promise<{
+export type ExternalLibraryImportJobStatus = {
+  running: boolean;
+  total: number;
+  processed: number;
   imported: number;
   skipped: number;
-}> {
-  const config = await getExternalLibraryConfig();
-  const state = readStateFile();
-  const entries = (state.lastScan?.discovered ?? []).concat(state.lastScan?.modified ?? []);
+  errors: number;
+  startedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+};
+
+let importJob: ExternalLibraryImportJobStatus = {
+  running: false,
+  total: 0,
+  processed: 0,
+  imported: 0,
+  skipped: 0,
+  errors: 0,
+  startedAt: null,
+  finishedAt: null,
+  error: null,
+};
+
+export function getExternalLibraryImportStatus(): ExternalLibraryImportJobStatus {
+  return { ...importJob };
+}
+
+async function runExternalLibraryImport(relativePaths: string[]): Promise<void> {
   const requested = new Set(relativePaths);
-  let imported = 0;
-  let skipped = 0;
 
-  for (const entry of entries) {
-    if (!requested.has(entry.relativePath)) continue;
+  try {
+    const config = await getExternalLibraryConfig();
+    const state = readStateFile();
+    const entries = (state.lastScan?.discovered ?? []).concat(state.lastScan?.modified ?? []);
 
-    try {
-      const safePath = ensureNoSymlinkEscape(config.rootDirectory, entry.fullPath);
-      const bytes = new Uint8Array(await readFile(safePath));
-      await saveAsset({
-        title: path.basename(entry.relativePath, path.extname(entry.relativePath)),
-        tags: [],
-        licenses: ["Unknown"],
-        fileName: path.basename(entry.fullPath),
-        mimeType: mimeTypeForPath(entry.fullPath),
-        size: bytes.byteLength,
-        bytes,
-      });
-      imported += 1;
-    } catch (errorValue) {
-      if (errorValue instanceof DuplicateAssetError) {
-        skipped += 1;
-        continue;
+    for (const entry of entries) {
+      if (!requested.has(entry.relativePath)) continue;
+
+      try {
+        const safePath = ensureNoSymlinkEscape(config.rootDirectory, entry.fullPath);
+        const bytes = new Uint8Array(await readFile(safePath));
+        await saveAsset({
+          title: path.basename(entry.relativePath, path.extname(entry.relativePath)),
+          tags: [],
+          licenses: ["Unknown"],
+          fileName: path.basename(entry.fullPath),
+          mimeType: mimeTypeForPath(entry.fullPath),
+          size: bytes.byteLength,
+          bytes,
+        });
+        importJob.imported += 1;
+      } catch (errorValue) {
+        if (errorValue instanceof DuplicateAssetError) {
+          importJob.skipped += 1;
+        } else {
+          importJob.errors += 1;
+        }
+      } finally {
+        importJob.processed += 1;
       }
-      throw errorValue;
     }
+  } catch (errorValue) {
+    importJob.error = errorValue instanceof Error ? errorValue.message : String(errorValue);
+  } finally {
+    importJob.running = false;
+    importJob.finishedAt = new Date().toISOString();
+  }
+}
+
+// Kicks off the import in the background and returns immediately so callers don't block on 65k+ file imports.
+export function startExternalLibraryImport(relativePaths: string[]): ExternalLibraryImportJobStatus {
+  if (importJob.running) {
+    throw new Error("An import is already in progress.");
   }
 
-  return { imported, skipped };
+  importJob = {
+    running: true,
+    total: relativePaths.length,
+    processed: 0,
+    imported: 0,
+    skipped: 0,
+    errors: 0,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    error: null,
+  };
+
+  void runExternalLibraryImport(relativePaths);
+
+  return { ...importJob };
 }

@@ -2,8 +2,8 @@ import { json, type RequestHandler } from "@sveltejs/kit";
 import {
   getExternalLibraryConfig,
   getExternalLibraryScanState,
-  importExternalLibraryEntries,
   scanExternalLibraries,
+  startExternalLibraryImport,
   updateExternalLibraryConfig,
   type ExternalLibraryConfig,
 } from "$lib/server/external-library";
@@ -61,7 +61,12 @@ export const POST: RequestHandler = async ({ locals, request }) => {
     const paths = Array.isArray(body.paths)
       ? body.paths.filter((entry): entry is string => typeof entry === "string")
       : [];
-    return json({ result: await importExternalLibraryEntries(paths) });
+    try {
+      const status = startExternalLibraryImport(paths);
+      return json({ status });
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : "Failed to start import." }, { status: 409 });
+    }
   }
 
   const scan = await scanExternalLibraries();

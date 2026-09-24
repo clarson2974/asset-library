@@ -47,6 +47,18 @@ export type ExternalLibraryScan = {
   unavailable: ExternalLibraryEntry[];
 };
 
+export type ExternalLibraryImportStatus = {
+  running: boolean;
+  total: number;
+  processed: number;
+  imported: number;
+  skipped: number;
+  errors: number;
+  startedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+};
+
 export type AssetUpdatePayload = {
   title: string;
   description: string;
@@ -196,20 +208,29 @@ export class AssetLibraryApiService {
     return payload.scan;
   }
 
-  async importExternalLibrary(paths: string[]): Promise<{ imported: number; skipped: number }> {
+  async importExternalLibrary(paths: string[]): Promise<ExternalLibraryImportStatus> {
     const response = await fetch("/api/integrations/external-library", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "import", paths }),
     });
     const payload = (await response.json()) as {
-      result?: { imported: number; skipped: number };
+      status?: ExternalLibraryImportStatus;
       error?: string;
     };
-    if (!response.ok || !payload.result) {
-      throw new Error(payload.error || "Failed to import external library files.");
+    if (!response.ok || !payload.status) {
+      throw new Error(payload.error || "Failed to start external library import.");
     }
-    return payload.result;
+    return payload.status;
+  }
+
+  async getExternalLibraryImportStatus(): Promise<ExternalLibraryImportStatus> {
+    const response = await fetch("/api/integrations/external-library/import-status");
+    if (!response.ok) {
+      throw new Error("Failed to load import status.");
+    }
+    const payload = (await response.json()) as { status: ExternalLibraryImportStatus };
+    return payload.status;
   }
 
   async replaceAssetFile(

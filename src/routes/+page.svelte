@@ -20,6 +20,7 @@
     AssetLibraryApiService,
     type AiConfig,
     type ExternalLibraryConfig,
+    type ExternalLibraryImportStatus,
     type ExternalLibraryScan,
   } from "$lib/services/asset-library-api";
   import {
@@ -134,6 +135,8 @@
   let externalLibraryOpen = false;
   let externalLibrarySaving = false;
   let externalLibraryScanning = false;
+  let externalLibraryImportStatus: ExternalLibraryImportStatus | null = null;
+  let externalLibraryImportPollHandle: ReturnType<typeof setInterval> | null = null;
   let themeMode: ThemeMode = "dark";
   let uploadInputEl: HTMLInputElement | null = null;
   let replaceInputEl: HTMLInputElement | null = null;
@@ -730,20 +733,47 @@
     }
   }
 
+  function stopExternalLibraryImportPolling(): void {
+    if (externalLibraryImportPollHandle !== null) {
+      clearInterval(externalLibraryImportPollHandle);
+      externalLibraryImportPollHandle = null;
+    }
+  }
+
+  async function pollExternalLibraryImportStatus(): Promise<void> {
+    try {
+      const status = await api.getExternalLibraryImportStatus();
+      externalLibraryImportStatus = status;
+      if (!status.running) {
+        stopExternalLibraryImportPolling();
+        await loadAssets();
+        if (status.error) {
+          toast.error(status.error);
+        } else {
+          toast.success(`Imported ${status.imported} file${status.imported === 1 ? "" : "s"}; skipped ${status.skipped} duplicate${status.skipped === 1 ? "" : "s"}.`);
+        }
+      }
+    } catch (error) {
+      stopExternalLibraryImportPolling();
+      toast.error(error instanceof Error ? error.message : "Failed to load import status.");
+    }
+  }
+
   async function importExternalLibrary(): Promise<void> {
     if (!externalLibraryScan) return;
-    externalLibraryScanning = true;
     try {
       const paths = externalLibraryScan.discovered
         .concat(externalLibraryScan.modified)
         .map((entry) => entry.relativePath);
-      const result = await api.importExternalLibrary(paths);
-      await loadAssets();
-      toast.success(`Imported ${result.imported} file${result.imported === 1 ? "" : "s"}; skipped ${result.skipped} duplicate${result.skipped === 1 ? "" : "s"}.`);
+      externalLibraryImportStatus = await api.importExternalLibrary(paths);
+      closeExternalLibraryDialog();
+      toast.success("Import started in the background.");
+      stopExternalLibraryImportPolling();
+      externalLibraryImportPollHandle = setInterval(() => {
+        void pollExternalLibraryImportStatus();
+      }, 1500);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to import external library files.");
-    } finally {
-      externalLibraryScanning = false;
+      toast.error(error instanceof Error ? error.message : "Failed to start external library import.");
     }
   }
 
@@ -1046,6 +1076,19 @@
   onMount(loadAssets);
   onMount(loadAiConfig);
   onMount(loadExternalLibrary);
+  onMount(async () => {
+    try {
+      const status = await api.getExternalLibraryImportStatus();
+      externalLibraryImportStatus = status;
+      if (status.running) {
+        externalLibraryImportPollHandle = setInterval(() => {
+          void pollExternalLibraryImportStatus();
+        }, 1500);
+      }
+    } catch {
+      // Import status is best-effort; ignore failures (e.g. unauthenticated).
+    }
+  });
   onMount(initializeTheme);
   onMount(onWindowScroll);
   onMount(() => {
@@ -1479,8 +1522,8 @@
       {/if}
 
       {#snippet actions()}
-        <Button onclick={importExternalLibrary} disabled={!externalLibraryScan || externalLibraryScanning || externalLibrarySaving}>
-          {externalLibraryScanning ? "Importing..." : "Import discovered"}
+        <Button onclick={importExternalLibrary} disabled={!externalLibraryScan || externalLibraryScanning || externalLibrarySaving || externalLibraryImportStatus?.running}>
+          Import discovered
         </Button>
         <Button onclick={scanExternalLibrary} disabled={externalLibraryScanning || externalLibrarySaving}>
           {externalLibraryScanning ? "Scanning..." : "Scan now"}
@@ -1546,5 +1589,13 @@
     >
       <Icon icon="mdi:arrow-up" width="1rem" height="1rem" aria-hidden="true" />
     </Button>
+  {/if}
+
+  {#if externalLibraryImportStatus?.running}
+    <div class="assetlib-import-footer" role="status" aria-live="polite">
+      <Icon icon="codex:loader" width="1rem" height="1rem" aria-hidden="true" />
+      Importing external library: {externalLibraryImportStatus.processed} / {externalLibraryImportStatus.total}
+      (imported {externalLibraryImportStatus.imported}, skipped {externalLibraryImportStatus.skipped})
+    </div>
   {/if}
 </main>
