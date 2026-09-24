@@ -11,7 +11,9 @@ import type {
 } from "$lib/types";
 import { generateAutoMetadata } from "$lib/server/ai";
 
-const dataRoot = path.join(process.cwd(), "data");
+const dataRoot = path.resolve(
+  process.env.ASSET_LIBRARY_DATA_DIR?.trim() || path.join(process.cwd(), "data"),
+);
 const uploadsDir = path.join(dataRoot, "uploads");
 const dbPath = path.join(dataRoot, "assets.db");
 const metadataPath = path.join(dataRoot, "assets.json");
@@ -87,6 +89,12 @@ type AssetRow = {
 
 let db: DatabaseSync | undefined;
 let storageReady: Promise<void> | undefined;
+
+export function resetStorageForTests(): void {
+  db?.close();
+  db = undefined;
+  storageReady = undefined;
+}
 
 export class DuplicateAssetError extends Error {
   existingAsset: AssetRecord;
@@ -991,5 +999,15 @@ export async function deleteAsset(id: string): Promise<boolean> {
 }
 
 export function getStoredFilePath(storedName: string): string {
-  return path.join(uploadsDir, storedName);
+  const resolvedPath = path.resolve(uploadsDir, storedName);
+  const relativePath = path.relative(uploadsDir, resolvedPath);
+  if (
+    relativePath === ".." ||
+    relativePath.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relativePath)
+  ) {
+    throw new Error("Stored file path escapes the uploads directory.");
+  }
+
+  return resolvedPath;
 }

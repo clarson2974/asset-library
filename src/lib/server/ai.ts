@@ -24,7 +24,9 @@ export interface AiConfig {
   customInstruction: string;
 }
 
-const dataRoot = path.join(process.cwd(), "data");
+const dataRoot = path.resolve(
+  process.env.ASSET_LIBRARY_DATA_DIR?.trim() || path.join(process.cwd(), "data"),
+);
 const configPath = path.join(dataRoot, "ai-config.json");
 
 const defaultConfig: AiConfig = {
