@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("$lib/server/ai", () => ({
@@ -162,5 +163,38 @@ describe("asset storage", () => {
       title: legacyRecord.title,
       previewKind: "text",
     });
+  });
+
+  it("tracks schema migrations and does not reapply completed migrations", async () => {
+    const assets = await loadAssetsModule();
+    await assets.saveAsset({
+      title: "Migration asset",
+      tags: ["migration"],
+      fileName: "migration.txt",
+      mimeType: "text/plain",
+      size: 7,
+      bytes: new TextEncoder().encode("versioned"),
+    });
+
+    const database = new DatabaseSync(path.join(dataRoot, "assets.db"));
+    const migrationRows = database
+      .prepare("SELECT id FROM schema_migrations ORDER BY applied_at ASC")
+      .all() as Array<{ id: string }>;
+    expect(migrationRows.length).toBeGreaterThan(0);
+    expect(migrationRows.map((row) => row.id)).toContain("001_initial_assets_schema");
+    database.close();
+
+    await expect(assets.getDatabaseHealth()).resolves.toMatchObject({ ok: true });
+
+    resetStorage?.();
+    const assetsAgain = await loadAssetsModule();
+    const databaseAgain = new DatabaseSync(path.join(dataRoot, "assets.db"));
+    const migrationRowsAgain = databaseAgain
+      .prepare("SELECT id FROM schema_migrations ORDER BY applied_at ASC")
+      .all() as Array<{ id: string }>;
+    expect(migrationRowsAgain).toHaveLength(migrationRows.length);
+    await expect(assetsAgain.readAssets()).resolves.toHaveLength(1);
+    databaseAgain.close();
+    resetStorage?.();
   });
 });

@@ -1,3 +1,4 @@
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -65,6 +66,7 @@ const scriptExtensions = new Set([
 const textDecoder = new TextDecoder();
 
 const DEFAULT_LICENSE = "Unknown";
+const MIGRATION_BACKUP_LIMIT = 5;
 
 type AssetRow = {
   id: string;
@@ -87,6 +89,59 @@ type AssetRow = {
   height: number | null;
 };
 
+type DatabaseHealth =
+  | {
+      ok: true;
+      path: string;
+      migrationCount: number;
+    }
+  | {
+      ok: false;
+      path: string;
+      error: string;
+    };
+
+type MigrationDefinition = {
+  id: string;
+  description: string;
+  run: (database: DatabaseSync) => void;
+};
+
+const migrations: MigrationDefinition[] = [
+  {
+    id: "001_initial_assets_schema",
+    description: "Create the base asset schema and index set.",
+    run(database) {
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS assets (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          description TEXT NOT NULL,
+          tags_json TEXT NOT NULL,
+          licenses_json TEXT NOT NULL,
+          source_url TEXT NOT NULL,
+          metadata_edited INTEGER NOT NULL,
+          upload_date TEXT NOT NULL,
+          original_name TEXT NOT NULL,
+          stored_name TEXT NOT NULL,
+          file_type TEXT NOT NULL,
+          hash TEXT,
+          mime_type TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          category TEXT NOT NULL,
+          preview_kind TEXT NOT NULL,
+          width INTEGER,
+          height INTEGER
+        );
+      `);
+      database.exec(
+        "CREATE INDEX IF NOT EXISTS idx_assets_upload_date ON assets(upload_date DESC)",
+      );
+      database.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_hash ON assets(hash)");
+    },
+  },
+];
+
 let db: DatabaseSync | undefined;
 let storageReady: Promise<void> | undefined;
 
@@ -108,6 +163,90 @@ export class DuplicateAssetError extends Error {
 
 function computeAssetHash(bytes: Uint8Array | Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function backupDatabaseBeforeMigration(): void {
+  if (!existsSync(dbPath)) {
+    return;
+  }
+
+  const backupDir = path.join(dataRoot, ".backups");
+  mkdirSync(backupDir, { recursive: true });
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backupPath = path.join(backupDir, `assets.db.${timestamp}.bak`);
+  copyFileSync(dbPath, backupPath);
+
+  const backups = readdirSync(backupDir)
+    .filter((name) => /^assets\.db\..+\.bak$/.test(name))
+    .sort();
+
+  const excessBackups = backups.slice(0, Math.max(0, backups.length - MIGRATION_BACKUP_LIMIT));
+  for (const staleName of excessBackups) {
+    rmSync(path.join(backupDir, staleName), { force: true });
+  }
+}
+
+function ensureSchemaMigrationsTable(database: DatabaseSync): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      id TEXT PRIMARY KEY,
+      description TEXT NOT NULL,
+      applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+}
+
+function applyMigrations(database: DatabaseSync): void {
+  ensureSchemaMigrationsTable(database);
+  const appliedMigrationIds = new Set(
+    (database
+      .prepare("SELECT id FROM schema_migrations")
+      .all() as Array<{ id: string }>).map((row) => row.id),
+  );
+  const unknownAppliedMigrations = [...appliedMigrationIds].filter(
+    (migrationId) => !migrations.some((migration) => migration.id === migrationId),
+  );
+
+  if (unknownAppliedMigrations.length > 0) {
+    throw new Error(
+      "Database schema is newer than this application supports. Unsafe downgrade refused.",
+    );
+  }
+
+  const pendingMigrations = migrations.filter(
+    (migration) => !appliedMigrationIds.has(migration.id),
+  );
+
+  if (pendingMigrations.length === 0) {
+    return;
+  }
+
+  backupDatabaseBeforeMigration();
+
+  for (const migration of pendingMigrations) {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      migration.run(database);
+      database
+        .prepare(
+          `
+            INSERT INTO schema_migrations (id, description, applied_at)
+            VALUES (@id, @description, @applied_at)
+          `,
+        )
+        .run({
+          id: migration.id,
+          description: migration.description,
+          applied_at: new Date().toISOString(),
+        });
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw new Error(
+        `Migration ${migration.id} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
 }
 
 async function ensureAssetHashes(): Promise<void> {
@@ -144,34 +283,31 @@ function getDb(): DatabaseSync {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA synchronous = NORMAL");
   db.exec("PRAGMA busy_timeout = 5000");
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS assets (
-      id TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
-      description TEXT NOT NULL,
-      tags_json TEXT NOT NULL,
-      licenses_json TEXT NOT NULL,
-      source_url TEXT NOT NULL,
-      metadata_edited INTEGER NOT NULL,
-      upload_date TEXT NOT NULL,
-      original_name TEXT NOT NULL,
-      stored_name TEXT NOT NULL,
-      file_type TEXT NOT NULL,
-      hash TEXT,
-      mime_type TEXT NOT NULL,
-      size INTEGER NOT NULL,
-      category TEXT NOT NULL,
-      preview_kind TEXT NOT NULL,
-      width INTEGER,
-      height INTEGER
-    );
-  `);
-  db.exec(
-    "CREATE INDEX IF NOT EXISTS idx_assets_upload_date ON assets(upload_date DESC)",
-  );
-  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_hash ON assets(hash)");
+  applyMigrations(db);
 
   return db;
+}
+
+export async function getDatabaseHealth(): Promise<DatabaseHealth> {
+  try {
+    await ensureStorage();
+    const database = getDb();
+    const migrationCountResult = database
+      .prepare("SELECT COUNT(*) AS count FROM schema_migrations")
+      .get() as { count: number } | undefined;
+
+    return {
+      ok: true,
+      path: dbPath,
+      migrationCount: Number(migrationCountResult?.count ?? 0),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      path: dbPath,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 function parseStringArray(value: string, fallback: string[] = []): string[] {
