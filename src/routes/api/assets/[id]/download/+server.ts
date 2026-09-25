@@ -1,6 +1,6 @@
-import { readFile } from "node:fs/promises";
 import { error, type RequestHandler } from "@sveltejs/kit";
-import { getAssetById, getStoredFilePath } from "$lib/server/assets";
+import { getAssetById, getAssetDiskLocation } from "$lib/server/assets";
+import { readAssetBytes } from "$lib/server/asset-file-io";
 
 export const GET: RequestHandler = async ({ params }) => {
   if (!params.id) {
@@ -13,8 +13,10 @@ export const GET: RequestHandler = async ({ params }) => {
   }
 
   try {
-    const bytes = await readFile(getStoredFilePath(asset.storedName));
-    return new Response(bytes, {
+    const location = await getAssetDiskLocation(asset.id);
+    if (!location) throw new Error("missing location");
+    const bytes = await readAssetBytes(location);
+    return new Response(new Uint8Array(bytes), {
       headers: {
         "content-type": asset.mimeType,
         "content-length": String(asset.size),

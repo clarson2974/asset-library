@@ -275,6 +275,14 @@ body {
   font-size: 0.85rem;
   box-shadow: var(--shadow-m);
   z-index: 10;
+  max-width: min(90vw, 40rem);
+}
+
+.assetlib-import-current-file {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.75;
 }
 
 .assetlib-topbar-actions {

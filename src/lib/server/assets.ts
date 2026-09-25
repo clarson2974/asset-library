@@ -1,5 +1,5 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFileSync, createReadStream, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
@@ -92,6 +92,8 @@ type AssetRow = {
   width: number | null;
   height: number | null;
   deleted_at?: string | null;
+  storage_mode?: string;
+  external_path?: string | null;
 };
 
 export type AssetSearchOptions = {
@@ -131,6 +133,8 @@ type AssetFileRow = {
   height: number | null;
   metadata_json: string;
   created_at: string;
+  storage_mode?: string;
+  external_path?: string | null;
 };
 
 type DatabaseHealth =
@@ -293,6 +297,27 @@ const migrations: MigrationDefinition[] = [
       const insert = database.prepare("INSERT INTO assets_search (asset_id, title, description, tags, licenses, original_name, category, file_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
       for (const row of rows) {
         insert.run(row.id, row.title, row.description, row.tags_json, row.licenses_json, row.original_name, row.category, row.file_type);
+      }
+    },
+  },
+  {
+    id: "005_external_storage_links",
+    description: "Support asset files that link to an external library path instead of a managed upload copy.",
+    run(database) {
+      const assetColumns = database.prepare("PRAGMA table_info(assets)").all() as Array<{ name: string }>;
+      if (!assetColumns.some((column) => column.name === "storage_mode")) {
+        database.exec("ALTER TABLE assets ADD COLUMN storage_mode TEXT NOT NULL DEFAULT 'managed'");
+      }
+      if (!assetColumns.some((column) => column.name === "external_path")) {
+        database.exec("ALTER TABLE assets ADD COLUMN external_path TEXT");
+      }
+
+      const fileColumns = database.prepare("PRAGMA table_info(asset_files)").all() as Array<{ name: string }>;
+      if (!fileColumns.some((column) => column.name === "storage_mode")) {
+        database.exec("ALTER TABLE asset_files ADD COLUMN storage_mode TEXT NOT NULL DEFAULT 'managed'");
+      }
+      if (!fileColumns.some((column) => column.name === "external_path")) {
+        database.exec("ALTER TABLE asset_files ADD COLUMN external_path TEXT");
       }
     },
   },
@@ -553,6 +578,8 @@ function rowToAssetRecord(row: AssetRow): AssetRecord {
         : fallbackPreviewKind,
     width: typeof row.width === "number" ? row.width : undefined,
     height: typeof row.height === "number" ? row.height : undefined,
+    storageMode: row.storage_mode === "external" ? "external" : "managed",
+    externalPath: row.external_path?.trim() || undefined,
     files: [],
   };
 }
@@ -603,6 +630,8 @@ function rowToAssetFile(row: AssetFileRow): AssetFileRecord {
       : "none",
     width: typeof row.width === "number" ? row.width : undefined,
     height: typeof row.height === "number" ? row.height : undefined,
+    storageMode: row.storage_mode === "external" ? "external" : "managed",
+    externalPath: row.external_path?.trim() || undefined,
     metadata,
     createdAt: row.created_at,
   };
@@ -614,7 +643,7 @@ function getAssetFiles(database: DatabaseSync, assetId: string): AssetFileRecord
       `
         SELECT id, asset_id, role, variant, original_name, stored_name, file_type,
           hash, mime_type, size, category, preview_kind, width, height,
-          metadata_json, created_at
+          metadata_json, created_at, storage_mode, external_path
         FROM asset_files
         WHERE asset_id = ?
         ORDER BY created_at ASC, id ASC
@@ -666,7 +695,9 @@ function insertRecord(database: DatabaseSync, record: AssetRecord): void {
           category,
           preview_kind,
           width,
-          height
+          height,
+          storage_mode,
+          external_path
         ) VALUES (
           @id,
           @title,
@@ -685,7 +716,9 @@ function insertRecord(database: DatabaseSync, record: AssetRecord): void {
           @category,
           @preview_kind,
           @width,
-          @height
+          @height,
+          @storage_mode,
+          @external_path
         )
       `,
     )
@@ -708,6 +741,8 @@ function insertRecord(database: DatabaseSync, record: AssetRecord): void {
       preview_kind: record.previewKind,
       width: record.width ?? null,
       height: record.height ?? null,
+      storage_mode: record.storageMode === "external" ? "external" : "managed",
+      external_path: record.storageMode === "external" ? (record.externalPath ?? null) : null,
     });
 }
 
@@ -721,11 +756,11 @@ function insertAssetFile(
         INSERT INTO asset_files (
           id, asset_id, role, variant, original_name, stored_name, file_type,
           hash, mime_type, size, category, preview_kind, width, height,
-          metadata_json, created_at
+          metadata_json, created_at, storage_mode, external_path
         ) VALUES (
           @id, @asset_id, @role, @variant, @original_name, @stored_name,
           @file_type, @hash, @mime_type, @size, @category, @preview_kind,
-          @width, @height, @metadata_json, @created_at
+          @width, @height, @metadata_json, @created_at, @storage_mode, @external_path
         )
       `,
     )
@@ -746,6 +781,8 @@ function insertAssetFile(
       height: file.height ?? null,
       metadata_json: JSON.stringify(file.metadata ?? {}),
       created_at: file.createdAt,
+      storage_mode: file.storageMode === "external" ? "external" : "managed",
+      external_path: file.storageMode === "external" ? (file.externalPath ?? null) : null,
     });
 }
 
@@ -809,6 +846,7 @@ async function migrateLegacyJsonIfNeeded(
           width: record.width,
           height: record.height,
           createdAt: record.uploadDate,
+          storageMode: "managed",
         });
       } catch {
         // Skip malformed or duplicate legacy entries during migration.
@@ -1114,7 +1152,8 @@ export async function searchAssets(options: AssetSearchOptions = {}): Promise<As
   const rows = database.prepare(`
     SELECT a.id, a.title, a.description, a.tags_json, a.licenses_json, a.source_url,
       a.metadata_edited, a.upload_date, a.original_name, a.stored_name, a.file_type,
-      a.hash, a.mime_type, a.size, a.category, a.preview_kind, a.width, a.height
+      a.hash, a.mime_type, a.size, a.category, a.preview_kind, a.width, a.height,
+      a.storage_mode, a.external_path
     FROM assets a
     ${match ? "JOIN assets_search s ON s.asset_id = a.id" : ""}
     ${whereSql}
@@ -1140,17 +1179,22 @@ export async function setAssetDeleted(id: string, deleted: boolean): Promise<boo
 }
 
 export function toAssetView(record: AssetRecord): AssetView {
+  // Never leak server-side filesystem paths to the client.
+  const { externalPath: _externalPath, ...safeRecord } = record;
   return {
-    ...record,
+    ...safeRecord,
     fileUrl: `/api/assets/${record.id}/file`,
     downloadUrl: `/api/assets/${record.id}/download`,
     textPreviewUrl: `/api/assets/${record.id}/text`,
-    files: record.files.map((file) => ({
-      ...file,
-      fileUrl: `/api/assets/${record.id}/files/${encodeURIComponent(file.id)}`,
-      downloadUrl: `/api/assets/${record.id}/files/${encodeURIComponent(file.id)}/download`,
-      textPreviewUrl: `/api/assets/${record.id}/files/${encodeURIComponent(file.id)}/text`,
-    })),
+    files: record.files.map((file) => {
+      const { externalPath: _fileExternalPath, ...safeFile } = file;
+      return {
+        ...safeFile,
+        fileUrl: `/api/assets/${record.id}/files/${encodeURIComponent(file.id)}`,
+        downloadUrl: `/api/assets/${record.id}/files/${encodeURIComponent(file.id)}/download`,
+        textPreviewUrl: `/api/assets/${record.id}/files/${encodeURIComponent(file.id)}/text`,
+      };
+    }),
   };
 }
 
@@ -1310,6 +1354,7 @@ export async function saveAsset(params: {
     width,
     height,
     files: [],
+    storageMode: "managed",
   };
 
   const file: AssetFileRecord = {
@@ -1329,6 +1374,7 @@ export async function saveAsset(params: {
     height: record.height,
     metadata: fileMetadata,
     createdAt: record.uploadDate,
+    storageMode: "managed",
   };
 
   await writeFile(path.join(uploadsDir, storedName), params.bytes);
@@ -1409,7 +1455,9 @@ export async function getAssetById(
           category,
           preview_kind,
           width,
-          height
+          height,
+          storage_mode,
+          external_path
         FROM assets
         WHERE id = ?
         LIMIT 1
@@ -1497,6 +1545,7 @@ async function buildAssetFile(
     height,
     metadata,
     createdAt: new Date().toISOString(),
+    storageMode: "managed",
   };
 }
 
@@ -1718,7 +1767,9 @@ export async function replaceAssetFile(
           category,
           preview_kind,
           width,
-          height
+          height,
+          storage_mode,
+          external_path
         FROM assets
         WHERE id = ?
         LIMIT 1
@@ -1795,7 +1846,9 @@ export async function replaceAssetFile(
   }
 
   const replacementPath = path.join(uploadsDir, storedName);
-  const currentPath = path.join(uploadsDir, current.storedName);
+  // Uploading a replacement always converts the asset to a managed (app-owned) copy; the external source file, if any, is left untouched.
+  const previousManagedPath =
+    current.storageMode === "managed" ? getStoredFilePath(current.storedName) : null;
   await writeFile(replacementPath, replacement.bytes);
 
   const uploadDate = new Date().toISOString();
@@ -1816,7 +1869,9 @@ export async function replaceAssetFile(
             width = @width,
             height = @height,
             upload_date = @upload_date,
-            metadata_edited = 0
+            metadata_edited = 0,
+            storage_mode = 'managed',
+            external_path = NULL
           WHERE id = @id
         `,
       )
@@ -1891,7 +1946,8 @@ export async function replaceAssetFile(
           UPDATE asset_files SET
             original_name = ?, stored_name = ?, file_type = ?, hash = ?,
             mime_type = ?, size = ?, category = ?, preview_kind = ?,
-            width = ?, height = ?, created_at = ?, metadata_json = ?
+            width = ?, height = ?, created_at = ?, metadata_json = ?,
+            storage_mode = 'managed', external_path = NULL
           WHERE id = ? AND asset_id = ?
         `,
       )
@@ -1923,8 +1979,8 @@ export async function replaceAssetFile(
       );
   }
 
-  if (storedName !== current.storedName) {
-    await rm(currentPath, { force: true });
+  if (previousManagedPath && storedName !== current.storedName) {
+    await rm(previousManagedPath, { force: true });
   }
 
   return getAssetById(id);
@@ -1934,8 +1990,8 @@ export async function deleteAsset(id: string): Promise<boolean> {
   await ensureStorage();
   const database = getDb();
   const rows = database
-    .prepare("SELECT stored_name FROM asset_files WHERE asset_id = ?")
-    .all(id) as Array<{ stored_name: string }>;
+    .prepare("SELECT stored_name, storage_mode FROM asset_files WHERE asset_id = ?")
+    .all(id) as Array<{ stored_name: string; storage_mode?: string }>;
 
   if (rows.length === 0) {
     return false;
@@ -1943,6 +1999,8 @@ export async function deleteAsset(id: string): Promise<boolean> {
 
   database.prepare("DELETE FROM assets WHERE id = ?").run(id);
   for (const row of rows) {
+    // Externally linked files are not owned by this app; only managed copies are removed from disk.
+    if (row.storage_mode === "external") continue;
     await rm(getStoredFilePath(row.stored_name), { force: true });
   }
   return true;
@@ -1960,4 +2018,205 @@ export function getStoredFilePath(storedName: string): string {
   }
 
   return resolvedPath;
+}
+
+// Streams the file instead of buffering it whole, so hashing a large externally-linked file doesn't require loading it into memory.
+export function computeFileHash(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(filePath);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(hash.digest("hex")));
+  });
+}
+
+// Reads only the first `maxBytes` of a file; enough to parse header-based metadata (e.g. WAV) without loading huge files fully.
+export async function readFileHead(filePath: string, maxBytes: number): Promise<Uint8Array> {
+  const handle = await open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(maxBytes);
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+    return new Uint8Array(buffer.subarray(0, bytesRead));
+  } finally {
+    await handle.close();
+  }
+}
+
+export type AssetDiskLocation =
+  | { mode: "managed"; path: string }
+  | { mode: "external"; path: string };
+
+export async function getAssetDiskLocation(assetId: string): Promise<AssetDiskLocation | undefined> {
+  await ensureStorage();
+  const row = getDb()
+    .prepare("SELECT stored_name, storage_mode, external_path FROM assets WHERE id = ?")
+    .get(assetId) as { stored_name: string; storage_mode: string | null; external_path: string | null } | undefined;
+  if (!row) return undefined;
+  if (row.storage_mode === "external" && row.external_path) {
+    return { mode: "external", path: row.external_path };
+  }
+  return { mode: "managed", path: getStoredFilePath(row.stored_name) };
+}
+
+export async function getAssetFileDiskLocationById(fileId: string): Promise<AssetDiskLocation | undefined> {
+  await ensureStorage();
+  const row = getDb()
+    .prepare("SELECT stored_name, storage_mode, external_path FROM asset_files WHERE id = ?")
+    .get(fileId) as { stored_name: string; storage_mode: string | null; external_path: string | null } | undefined;
+  if (!row) return undefined;
+  if (row.storage_mode === "external" && row.external_path) {
+    return { mode: "external", path: row.external_path };
+  }
+  return { mode: "managed", path: getStoredFilePath(row.stored_name) };
+}
+
+// Registers an asset that links to a file in an externally scanned library directory instead of copying it into uploads/.
+export async function saveExternalAsset(params: {
+  title: string;
+  description?: string;
+  tags: string[];
+  licenses?: string[];
+  sourceUrl?: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  absolutePath: string;
+  hash: string;
+}): Promise<AssetRecord> {
+  await ensureStorage();
+  const database = getDb();
+  await ensureAssetHashes();
+
+  const duplicateRow = database
+    .prepare(
+      `
+        SELECT
+          id, title, description, tags_json, licenses_json, source_url,
+          metadata_edited, upload_date, original_name, stored_name, file_type,
+          hash, mime_type, size, category, preview_kind, width, height,
+          storage_mode, external_path
+        FROM assets
+        WHERE hash = ?
+        LIMIT 1
+      `,
+    )
+    .get(params.hash) as AssetRow | undefined;
+  if (duplicateRow) {
+    throw new DuplicateAssetError(hydrateAsset(database, rowToAssetRecord(duplicateRow)));
+  }
+
+  const id = randomUUID();
+  const category = getCategory(params.fileName, params.mimeType);
+  const previewKind = getPreviewKind(category, params.fileName, params.mimeType);
+  const normalizedLicenses = (params.licenses ?? [])
+    .map((license) => license.trim())
+    .filter(Boolean);
+
+  let width: number | undefined;
+  let height: number | undefined;
+  if (previewKind === "image") {
+    try {
+      const { default: sizeOf } = await import("image-size");
+      const dims = sizeOf(params.absolutePath);
+      if (typeof dims.width === "number" && typeof dims.height === "number") {
+        width = dims.width;
+        height = dims.height;
+      }
+    } catch (err) {
+      console.warn("Could not determine image dimensions:", err);
+    }
+  }
+
+  const autoMetadata = await generateAutoMetadata({
+    title: params.title,
+    originalName: params.fileName,
+    category,
+    mimeType: params.mimeType,
+    existingTags: params.tags,
+    existingDescription: params.description ?? "",
+  });
+
+  const headerBytes = category === "audio" ? await readFileHead(params.absolutePath, 65_536) : undefined;
+  const fileMetadata = extractAssetFileMetadata({
+    fileName: params.fileName,
+    mimeType: params.mimeType,
+    bytes: headerBytes ?? new Uint8Array(),
+    category,
+  });
+
+  const record: AssetRecord = {
+    id,
+    title: params.title,
+    description: autoMetadata.description,
+    tags: autoMetadata.tags,
+    licenses: normalizedLicenses.length > 0 ? normalizedLicenses : [DEFAULT_LICENSE],
+    sourceUrl: params.sourceUrl ?? "",
+    metadataEdited: false,
+    uploadDate: new Date().toISOString(),
+    originalName: params.fileName,
+    storedName: path.basename(params.absolutePath),
+    fileType: getFileType(params.fileName, params.mimeType),
+    hash: params.hash,
+    mimeType: params.mimeType,
+    size: params.size,
+    category,
+    previewKind,
+    width,
+    height,
+    files: [],
+    storageMode: "external",
+    externalPath: params.absolutePath,
+  };
+
+  const file: AssetFileRecord = {
+    id: randomUUID(),
+    assetId: id,
+    role: "source",
+    variant: "",
+    originalName: record.originalName,
+    storedName: record.storedName,
+    fileType: record.fileType,
+    hash: record.hash,
+    mimeType: record.mimeType,
+    size: record.size,
+    category: record.category,
+    previewKind: record.previewKind,
+    width: record.width,
+    height: record.height,
+    metadata: fileMetadata,
+    createdAt: record.uploadDate,
+    storageMode: "external",
+    externalPath: params.absolutePath,
+  };
+
+  try {
+    insertRecord(database, record);
+    insertAssetFile(database, file);
+    indexAsset(database, record);
+  } catch (errorValue) {
+    const message = errorValue instanceof Error ? errorValue.message : String(errorValue);
+    if (message.includes("UNIQUE constraint failed")) {
+      const existing = database
+        .prepare(
+          `
+            SELECT
+              id, title, description, tags_json, licenses_json, source_url,
+              metadata_edited, upload_date, original_name, stored_name, file_type,
+              hash, mime_type, size, category, preview_kind, width, height,
+              storage_mode, external_path
+            FROM assets
+            WHERE hash = ?
+            LIMIT 1
+          `,
+        )
+        .get(params.hash) as AssetRow | undefined;
+      if (existing) {
+        throw new DuplicateAssetError(hydrateAsset(database, rowToAssetRecord(existing)));
+      }
+    }
+    throw errorValue;
+  }
+
+  return { ...record, files: [file] };
 }

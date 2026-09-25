@@ -1,7 +1,6 @@
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { DuplicateAssetError, saveAsset } from "$lib/server/assets";
+import { computeFileHash, DuplicateAssetError, saveExternalAsset } from "$lib/server/assets";
 
 export type ExternalLibraryScanStatus = "ok" | "warning" | "error";
 
@@ -502,6 +501,38 @@ export async function getExternalLibraryScanState(): Promise<ExternalLibraryScan
   return state;
 }
 
+export class ExternalAssetUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExternalAssetUnavailableError";
+  }
+}
+
+// Re-validates an externally linked asset's path against the *current* library config before every read,
+// so disabling the library, moving the root, or a symlink appearing after import can't expose files outside it.
+export async function resolveExternalAssetReadPath(absolutePath: string): Promise<string> {
+  const config = await getExternalLibraryConfig();
+  if (!config.enabled) {
+    throw new ExternalAssetUnavailableError("External library is disabled.");
+  }
+
+  const rootPath = path.resolve(config.rootDirectory || defaultConfig().rootDirectory);
+  let safePath: string;
+  try {
+    safePath = ensureNoSymlinkEscape(rootPath, absolutePath);
+  } catch (errorValue) {
+    throw new ExternalAssetUnavailableError(
+      errorValue instanceof Error ? errorValue.message : "External asset path is no longer valid.",
+    );
+  }
+
+  if (!existsSync(safePath) || !statSync(safePath, { throwIfNoEntry: false })?.isFile()) {
+    throw new ExternalAssetUnavailableError("External source file is missing.");
+  }
+
+  return safePath;
+}
+
 function mimeTypeForPath(filePath: string): string {
   const mimeTypes: Record<string, string> = {
     ".glb": "model/gltf-binary",
@@ -534,7 +565,12 @@ export type ExternalLibraryImportJobStatus = {
   startedAt: string | null;
   finishedAt: string | null;
   error: string | null;
+  currentFile: string | null;
+  lastErrorFile: string | null;
 };
+
+// Hard ceiling per file so a single unresponsive AI backend or corrupt file can't stall the whole import.
+const IMPORT_FILE_TIMEOUT_MS = 180_000;
 
 let importJob: ExternalLibraryImportJobStatus = {
   running: false,
@@ -546,7 +582,27 @@ let importJob: ExternalLibraryImportJobStatus = {
   startedAt: null,
   finishedAt: null,
   error: null,
+  currentFile: null,
+  lastErrorFile: null,
 };
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Timed out after ${timeoutMs}ms importing ${label}`));
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 
 export function getExternalLibraryImportStatus(): ExternalLibraryImportJobStatus {
   return { ...importJob };
@@ -563,27 +619,42 @@ async function runExternalLibraryImport(relativePaths: string[]): Promise<void> 
     for (const entry of entries) {
       if (!requested.has(entry.relativePath)) continue;
 
+      importJob.currentFile = entry.relativePath;
       try {
-        const safePath = ensureNoSymlinkEscape(config.rootDirectory, entry.fullPath);
-        const bytes = new Uint8Array(await readFile(safePath));
-        await saveAsset({
-          title: path.basename(entry.relativePath, path.extname(entry.relativePath)),
-          tags: [],
-          licenses: ["Unknown"],
-          fileName: path.basename(entry.fullPath),
-          mimeType: mimeTypeForPath(entry.fullPath),
-          size: bytes.byteLength,
-          bytes,
-        });
+        await withTimeout(
+          (async () => {
+            const safePath = ensureNoSymlinkEscape(config.rootDirectory, entry.fullPath);
+            const hash = await computeFileHash(safePath);
+            const stats = statSync(safePath);
+            await saveExternalAsset({
+              title: path.basename(entry.relativePath, path.extname(entry.relativePath)),
+              tags: [],
+              licenses: ["Unknown"],
+              fileName: path.basename(entry.fullPath),
+              mimeType: mimeTypeForPath(entry.fullPath),
+              size: stats.size,
+              absolutePath: safePath,
+              hash,
+            });
+          })(),
+          IMPORT_FILE_TIMEOUT_MS,
+          entry.relativePath,
+        );
         importJob.imported += 1;
       } catch (errorValue) {
         if (errorValue instanceof DuplicateAssetError) {
           importJob.skipped += 1;
         } else {
           importJob.errors += 1;
+          importJob.lastErrorFile = entry.relativePath;
+          console.error("[external-library-import] failed to import file", {
+            relativePath: entry.relativePath,
+            error: errorValue instanceof Error ? errorValue.message : String(errorValue),
+          });
         }
       } finally {
         importJob.processed += 1;
+        importJob.currentFile = null;
       }
     }
   } catch (errorValue) {
@@ -610,6 +681,8 @@ export function startExternalLibraryImport(relativePaths: string[]): ExternalLib
     startedAt: new Date().toISOString(),
     finishedAt: null,
     error: null,
+    currentFile: null,
+    lastErrorFile: null,
   };
 
   void runExternalLibraryImport(relativePaths);

@@ -40,9 +40,11 @@ export interface AssetFileRecord {
   height?: number;
   metadata?: Record<string, unknown>;
   createdAt: string;
+  storageMode: "managed" | "external";
+  externalPath?: string;
 }
 
-export interface AssetFileView extends AssetFileRecord {
+export interface AssetFileView extends Omit<AssetFileRecord, "externalPath"> {
   fileUrl: string;
   downloadUrl: string;
   textPreviewUrl: string;
@@ -74,9 +76,11 @@ export interface AssetRecord {
   width?: number;
   height?: number;
   files: AssetFileRecord[];
+  storageMode: "managed" | "external";
+  externalPath?: string;
 }
 
-export interface AssetView extends AssetRecord {
+export interface AssetView extends Omit<AssetRecord, "externalPath" | "files"> {
   fileUrl: string;
   downloadUrl: string;
   textPreviewUrl: string;

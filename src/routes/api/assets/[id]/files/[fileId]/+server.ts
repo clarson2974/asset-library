@@ -1,13 +1,13 @@
-import { readFile } from "node:fs/promises";
 import { error, json, type RequestHandler } from "@sveltejs/kit";
 import {
   DuplicateAssetError,
   getAssetFileById,
-  getStoredFilePath,
+  getAssetFileDiskLocationById,
   replaceAssetChildFile,
   toAssetView,
   getAssetById,
 } from "$lib/server/assets";
+import { readAssetBytes } from "$lib/server/asset-file-io";
 import { requireUserCapability } from "$lib/server/auth";
 
 async function resolveFile(assetId: string | undefined, fileId: string | undefined) {
@@ -23,8 +23,10 @@ export const GET: RequestHandler = async ({ locals, params }) => {
   }
   const file = await resolveFile(params.id, params.fileId);
   try {
-    const bytes = await readFile(getStoredFilePath(file.storedName));
-    return new Response(bytes, {
+    const location = await getAssetFileDiskLocationById(file.id);
+    if (!location) throw new Error("missing location");
+    const bytes = await readAssetBytes(location);
+    return new Response(new Uint8Array(bytes), {
       headers: {
         "content-type": file.mimeType,
         "content-length": String(file.size),

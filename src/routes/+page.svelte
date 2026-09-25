@@ -98,6 +98,7 @@
   let loadingMore = false;
   let assetPage = 1;
   let assetTotalPages = 1;
+  let assetTotalCount = 0;
 
   let isDragging = false;
   let pageDragDepth = 0;
@@ -640,6 +641,7 @@
       assets = result.assets;
       assetPage = result.pagination.page;
       assetTotalPages = result.pagination.totalPages;
+      assetTotalCount = result.pagination.total;
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Failed to load assets.",
@@ -657,6 +659,7 @@
       assets = [...assets, ...result.assets];
       assetPage = result.pagination.page;
       assetTotalPages = result.pagination.totalPages;
+      assetTotalCount = result.pagination.total;
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Failed to load more assets.");
     } finally {
@@ -733,16 +736,21 @@
     }
   }
 
+  const MAX_IMPORT_POLL_FAILURES = 5;
+  let externalLibraryImportPollFailures = 0;
+
   function stopExternalLibraryImportPolling(): void {
     if (externalLibraryImportPollHandle !== null) {
       clearInterval(externalLibraryImportPollHandle);
       externalLibraryImportPollHandle = null;
     }
+    externalLibraryImportPollFailures = 0;
   }
 
   async function pollExternalLibraryImportStatus(): Promise<void> {
     try {
       const status = await api.getExternalLibraryImportStatus();
+      externalLibraryImportPollFailures = 0;
       externalLibraryImportStatus = status;
       if (!status.running) {
         stopExternalLibraryImportPolling();
@@ -754,8 +762,19 @@
         }
       }
     } catch (error) {
-      stopExternalLibraryImportPolling();
-      toast.error(error instanceof Error ? error.message : "Failed to load import status.");
+      // Transient network hiccups shouldn't abandon a still-running server-side import; only give up after repeated failures.
+      externalLibraryImportPollFailures += 1;
+      if (externalLibraryImportPollFailures >= MAX_IMPORT_POLL_FAILURES) {
+        stopExternalLibraryImportPolling();
+        if (externalLibraryImportStatus) {
+          externalLibraryImportStatus = { ...externalLibraryImportStatus, running: false };
+        }
+        toast.error(
+          error instanceof Error
+            ? `Lost connection while checking import status: ${error.message}`
+            : "Lost connection while checking import status.",
+        );
+      }
     }
   }
 
@@ -1140,7 +1159,7 @@
       />
       <h1>Asset Library</h1>
       <div class="assetlib-title-stats">
-        <span>{assets.length}</span>
+        <span>{assetTotalCount}</span>
         {#if uploadPendingCount > 0}
           <span class="active assetlib-upload-indicator" aria-live="polite">
             <Icon
@@ -1595,7 +1614,10 @@
     <div class="assetlib-import-footer" role="status" aria-live="polite">
       <Icon icon="codex:loader" width="1rem" height="1rem" aria-hidden="true" />
       Importing external library: {externalLibraryImportStatus.processed} / {externalLibraryImportStatus.total}
-      (imported {externalLibraryImportStatus.imported}, skipped {externalLibraryImportStatus.skipped})
+      (imported {externalLibraryImportStatus.imported}, skipped {externalLibraryImportStatus.skipped}, errors {externalLibraryImportStatus.errors})
+      {#if externalLibraryImportStatus.currentFile}
+        <span class="assetlib-import-current-file">– {externalLibraryImportStatus.currentFile}</span>
+      {/if}
     </div>
   {/if}
 </main>

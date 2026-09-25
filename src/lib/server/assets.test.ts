@@ -361,4 +361,42 @@ describe("asset storage", () => {
     databaseAgain.close();
     resetStorage?.();
   });
+
+  it("links external assets without copying the source file, and never deletes it from disk", async () => {
+    const assets = await loadAssetsModule();
+
+    const externalDir = await mkdtemp(path.join(os.tmpdir(), "asset-library-external-"));
+    const sourcePath = path.join(externalDir, "hero.txt");
+    await writeFile(sourcePath, "external source content");
+
+    try {
+      const hash = await assets.computeFileHash(sourcePath);
+      const record = await assets.saveExternalAsset({
+        title: "Hero",
+        tags: [],
+        licenses: ["Unknown"],
+        fileName: "hero.txt",
+        mimeType: "text/plain",
+        size: 24,
+        absolutePath: sourcePath,
+        hash,
+      });
+
+      expect(record.storageMode).toBe("external");
+
+      const location = await assets.getAssetDiskLocation(record.id);
+      expect(location).toEqual({ mode: "external", path: sourcePath });
+
+      // No managed copy should exist in uploads/.
+      const view = assets.toAssetView(await assets.getAssetById(record.id) as NonNullable<Awaited<ReturnType<typeof assets.getAssetById>>>);
+      expect(view).not.toHaveProperty("externalPath");
+      expect((view as unknown as Record<string, unknown>).storageMode).toBe("external");
+
+      await expect(assets.deleteAsset(record.id)).resolves.toBe(true);
+      // The source file must still exist after deleting the library entry.
+      await expect(readFile(sourcePath, "utf8")).resolves.toEqual("external source content");
+    } finally {
+      await rm(externalDir, { recursive: true, force: true });
+    }
+  });
 });

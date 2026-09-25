@@ -57,6 +57,8 @@ export type ExternalLibraryImportStatus = {
   startedAt: string | null;
   finishedAt: string | null;
   error: string | null;
+  currentFile: string | null;
+  lastErrorFile: string | null;
 };
 
 export type AssetUpdatePayload = {

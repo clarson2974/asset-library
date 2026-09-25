@@ -1,12 +1,12 @@
-import { readFile } from "node:fs/promises";
 import { error, json, type RequestHandler } from "@sveltejs/kit";
 import {
   DuplicateAssetError,
   getAssetById,
-  getStoredFilePath,
+  getAssetDiskLocation,
   replaceAssetFile,
   toAssetView,
 } from "$lib/server/assets";
+import { readAssetBytes } from "$lib/server/asset-file-io";
 import { requireUserCapability } from "$lib/server/auth";
 
 const FILE_CACHE_CONTROL = "public, max-age=31536000, immutable";
@@ -77,7 +77,9 @@ export const GET: RequestHandler = async ({ locals, params, request }) => {
 
   let bytes: Buffer;
   try {
-    bytes = await readFile(getStoredFilePath(asset.storedName));
+    const location = await getAssetDiskLocation(asset.id);
+    if (!location) throw new Error("missing location");
+    bytes = await readAssetBytes(location);
   } catch {
     throw error(404, "Asset file missing on disk");
   }

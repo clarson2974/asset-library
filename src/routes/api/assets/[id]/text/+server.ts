@@ -1,6 +1,6 @@
-import { readFile } from "node:fs/promises";
 import { error, json, type RequestHandler } from "@sveltejs/kit";
-import { getAssetById, getStoredFilePath } from "$lib/server/assets";
+import { getAssetById, getAssetDiskLocation } from "$lib/server/assets";
+import { readAssetBytes } from "$lib/server/asset-file-io";
 
 const decoder = new TextDecoder();
 
@@ -19,7 +19,9 @@ export const GET: RequestHandler = async ({ params }) => {
   }
 
   try {
-    const bytes = await readFile(getStoredFilePath(asset.storedName));
+    const location = await getAssetDiskLocation(asset.id);
+    if (!location) throw new Error("missing location");
+    const bytes = await readAssetBytes(location);
     const clipped = bytes.subarray(0, 32_000);
     return json({ text: decoder.decode(clipped) });
   } catch {
