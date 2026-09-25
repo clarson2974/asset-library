@@ -114,6 +114,7 @@
 
   let uploadQueue: QueuedUpload[] = [];
   let queueRunning = false;
+  let queuePaused = false;
   let uploadBatchTotal = 0;
   let uploadProcessedCount = 0;
   let importPrefillOpen = false;
@@ -602,6 +603,8 @@
     let uploadedCount = 0;
     const worker = async (): Promise<void> => {
       while (uploadQueue.length > 0) {
+        if (queuePaused) return;
+
         const nextUpload = uploadQueue[0];
         uploadQueue = uploadQueue.slice(1);
 
@@ -626,12 +629,32 @@
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
     queueRunning = false;
+
+    // If the queue was paused with files still pending, keep the batch open
+    // so the indicator stays visible; resume() will restart the workers.
+    if (queuePaused && uploadQueue.length > 0) {
+      return;
+    }
+
+    queuePaused = false;
     if (uploadedCount > 0) {
       toast.success(
         `Uploaded ${uploadedCount} file${uploadedCount === 1 ? "" : "s"}.`,
       );
       await loadAssets();
     }
+  }
+
+  function pauseUploadQueue(): void {
+    if (!queueRunning || queuePaused) return;
+    queuePaused = true;
+    toast.success("Upload queue paused.");
+  }
+
+  function resumeUploadQueue(): void {
+    if (!queuePaused) return;
+    queuePaused = false;
+    void processUploadQueue();
   }
 
   async function loadAssets(): Promise<void> {
@@ -793,6 +816,24 @@
       }, 1500);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Failed to start external library import.");
+    }
+  }
+
+  async function pauseExternalLibraryImport(): Promise<void> {
+    try {
+      externalLibraryImportStatus = await api.pauseExternalLibraryImport();
+      toast.success("Import paused.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to pause import.");
+    }
+  }
+
+  async function resumeExternalLibraryImport(): Promise<void> {
+    try {
+      externalLibraryImportStatus = await api.resumeExternalLibraryImport();
+      toast.success("Import resumed.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to resume import.");
     }
   }
 
@@ -1163,12 +1204,33 @@
         {#if uploadPendingCount > 0}
           <span class="active assetlib-upload-indicator" aria-live="polite">
             <Icon
-              icon="codex:loader"
+              icon={queuePaused ? "mdi:pause" : "codex:loader"}
               width="1rem"
               height="1rem"
               aria-hidden="true"
             />
-            Uploading {uploadPendingCount} left
+            {queuePaused ? "Paused" : "Uploading"} {uploadPendingCount} left
+            {#if queuePaused}
+              <button
+                type="button"
+                class="assetlib-upload-control"
+                title="Resume uploads"
+                aria-label="Resume uploads"
+                onclick={resumeUploadQueue}
+              >
+                <Icon icon="mdi:play" width="0.9rem" height="0.9rem" aria-hidden="true" />
+              </button>
+            {:else}
+              <button
+                type="button"
+                class="assetlib-upload-control"
+                title="Pause uploads"
+                aria-label="Pause uploads"
+                onclick={pauseUploadQueue}
+              >
+                <Icon icon="mdi:pause" width="0.9rem" height="0.9rem" aria-hidden="true" />
+              </button>
+            {/if}
           </span>
         {/if}
       </div>
@@ -1218,7 +1280,7 @@
         type="file"
         multiple
         class="assetlib-file-input-hidden"
-        on:change={(event) => {
+        onchange={(event) => {
           const target = event.currentTarget as HTMLInputElement;
           queueFiles(Array.from(target.files ?? []));
           target.value = "";
@@ -1314,7 +1376,7 @@
         bind:this={replaceInputEl}
         type="file"
         class="assetlib-file-input-hidden"
-        on:change={replaceActiveAssetFile}
+        onchange={replaceActiveAssetFile}
       />
 
       <label class="assetlib-modal-label">
@@ -1612,11 +1674,41 @@
 
   {#if externalLibraryImportStatus?.running}
     <div class="assetlib-import-footer" role="status" aria-live="polite">
-      <Icon icon="codex:loader" width="1rem" height="1rem" aria-hidden="true" />
-      Importing external library: {externalLibraryImportStatus.processed} / {externalLibraryImportStatus.total}
+      <Icon
+        icon={externalLibraryImportStatus.paused ? "mdi:pause" : "codex:loader"}
+        width="1rem"
+        height="1rem"
+        aria-hidden="true"
+      />
+      {#if externalLibraryImportStatus.paused}
+        Import paused: {externalLibraryImportStatus.processed} / {externalLibraryImportStatus.total}
+      {:else}
+        Importing external library: {externalLibraryImportStatus.processed} / {externalLibraryImportStatus.total}
+      {/if}
       (imported {externalLibraryImportStatus.imported}, skipped {externalLibraryImportStatus.skipped}, errors {externalLibraryImportStatus.errors})
       {#if externalLibraryImportStatus.currentFile}
         <span class="assetlib-import-current-file">– {externalLibraryImportStatus.currentFile}</span>
+      {/if}
+      {#if externalLibraryImportStatus.paused}
+        <Button
+          onclick={resumeExternalLibraryImport}
+          title="Resume import"
+          ariaLabel="Resume import"
+          iconOnly={true}
+          extraClass="assetlib-import-control"
+        >
+          <Icon icon="mdi:play" width="1rem" height="1rem" aria-hidden="true" />
+        </Button>
+      {:else}
+        <Button
+          onclick={pauseExternalLibraryImport}
+          title="Pause import"
+          ariaLabel="Pause import"
+          iconOnly={true}
+          extraClass="assetlib-import-control"
+        >
+          <Icon icon="mdi:pause" width="1rem" height="1rem" aria-hidden="true" />
+        </Button>
       {/if}
     </div>
   {/if}

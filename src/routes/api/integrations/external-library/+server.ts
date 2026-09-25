@@ -2,6 +2,8 @@ import { json, type RequestHandler } from "@sveltejs/kit";
 import {
   getExternalLibraryConfig,
   getExternalLibraryScanState,
+  pauseExternalLibraryImport,
+  resumeExternalLibraryImport,
   scanExternalLibraries,
   startExternalLibraryImport,
   updateExternalLibraryConfig,
@@ -66,6 +68,24 @@ export const POST: RequestHandler = async ({ locals, request }) => {
       return json({ status });
     } catch (error) {
       return json({ error: error instanceof Error ? error.message : "Failed to start import." }, { status: 409 });
+    }
+  }
+
+  if (body.action === "pause") {
+    try {
+      const status = pauseExternalLibraryImport();
+      return json({ status });
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : "Failed to pause import." }, { status: 409 });
+    }
+  }
+
+  if (body.action === "resume") {
+    try {
+      const status = resumeExternalLibraryImport();
+      return json({ status });
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : "Failed to resume import." }, { status: 409 });
     }
   }
 

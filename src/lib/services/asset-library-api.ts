@@ -49,6 +49,7 @@ export type ExternalLibraryScan = {
 
 export type ExternalLibraryImportStatus = {
   running: boolean;
+  paused: boolean;
   total: number;
   processed: number;
   imported: number;
@@ -56,6 +57,7 @@ export type ExternalLibraryImportStatus = {
   errors: number;
   startedAt: string | null;
   finishedAt: string | null;
+  pausedAt: string | null;
   error: string | null;
   currentFile: string | null;
   lastErrorFile: string | null;
@@ -222,6 +224,38 @@ export class AssetLibraryApiService {
     };
     if (!response.ok || !payload.status) {
       throw new Error(payload.error || "Failed to start external library import.");
+    }
+    return payload.status;
+  }
+
+  async pauseExternalLibraryImport(): Promise<ExternalLibraryImportStatus> {
+    const response = await fetch("/api/integrations/external-library", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "pause" }),
+    });
+    const payload = (await response.json()) as {
+      status?: ExternalLibraryImportStatus;
+      error?: string;
+    };
+    if (!response.ok || !payload.status) {
+      throw new Error(payload.error || "Failed to pause import.");
+    }
+    return payload.status;
+  }
+
+  async resumeExternalLibraryImport(): Promise<ExternalLibraryImportStatus> {
+    const response = await fetch("/api/integrations/external-library", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "resume" }),
+    });
+    const payload = (await response.json()) as {
+      status?: ExternalLibraryImportStatus;
+      error?: string;
+    };
+    if (!response.ok || !payload.status) {
+      throw new Error(payload.error || "Failed to resume import.");
     }
     return payload.status;
   }
