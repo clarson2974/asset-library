@@ -86,3 +86,34 @@ export interface AssetView extends Omit<AssetRecord, "externalPath" | "files"> {
   textPreviewUrl: string;
   files: AssetFileView[];
 }
+
+export interface AssetFacetCount {
+  value: string;
+  count: number;
+}
+
+// Library-wide filter counts over non-deleted assets (GET /api/assets/facets).
+export interface AssetFacets {
+  total: number;
+  todo: number;
+  categories: Partial<Record<AssetCategory, number>>;
+  tags: AssetFacetCount[];
+  licenses: AssetFacetCount[];
+}
+
+export type AssetSortMode =
+  | "best-match"
+  | "newest"
+  | "oldest"
+  | "title-asc"
+  | "size-desc"
+  | "needs-metadata";
+
+export interface AssetListQuery {
+  q?: string;
+  categories?: AssetCategory[];
+  tags?: string[];
+  licenses?: string[];
+  todoOnly?: boolean;
+  sort?: AssetSortMode;
+}

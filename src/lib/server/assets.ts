@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { TextDecoder } from "node:util";
 import type {
   AssetCategory,
+  AssetFacets,
   AssetFileMetadataKind,
   AssetFileRecord,
   AssetFileRole,
@@ -929,6 +930,35 @@ function getAudioAttachmentFormat(
   return undefined;
 }
 
+// Content sent to the AI model alongside the file name: texture and wav/mp3 bytes, or the first 4 KB of text.
+function getAutoMetadataAttachments(params: {
+  fileName: string;
+  mimeType: string;
+  category: AssetCategory;
+  previewKind: AssetPreviewKind;
+  bytes: Uint8Array;
+}): Pick<Parameters<typeof generateAutoMetadata>[0], "textSnippet" | "imageFile" | "audioFile"> {
+  const mimeType = params.mimeType || "application/octet-stream";
+  const audioFormat =
+    params.category === "audio" ? getAudioAttachmentFormat(params.fileName, mimeType) : undefined;
+  return {
+    textSnippet:
+      params.previewKind === "text" ? textDecoder.decode(params.bytes.slice(0, 4_000)) : undefined,
+    imageFile: params.category === "texture" ? { mimeType, bytes: params.bytes } : undefined,
+    audioFile: audioFormat ? { format: audioFormat, bytes: params.bytes } : undefined,
+  };
+}
+
+// Whether AI tagging needs the file's full bytes, only its first 4 KB, or nothing beyond the name.
+export function getAutoMetadataReadSize(
+  record: Pick<AssetRecord, "category" | "previewKind" | "originalName" | "mimeType">,
+): "full" | "head" | "none" {
+  if (record.category === "texture") return "full";
+  if (record.category === "audio" && getAudioAttachmentFormat(record.originalName, record.mimeType)) return "full";
+  if (record.previewKind === "text") return "head";
+  return "none";
+}
+
 export function detectPbrTextureSet(fileName: string): {
   kind: string;
   value: string;
@@ -1169,6 +1199,43 @@ export async function searchAssets(options: AssetSearchOptions = {}): Promise<As
   };
 }
 
+// Library-wide filter counts over non-deleted assets, independent of the current query, so the
+// filter pane stays complete while the browser only holds one page of results.
+export async function getAssetFacets(): Promise<AssetFacets> {
+  await ensureStorage();
+  const database = getDb();
+  const totals = database
+    .prepare(
+      "SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN metadata_edited = 0 THEN 1 ELSE 0 END), 0) AS todo FROM assets WHERE deleted_at IS NULL",
+    )
+    .get() as { total: number; todo: number };
+  const categoryRows = database
+    .prepare("SELECT category, COUNT(*) AS count FROM assets WHERE deleted_at IS NULL GROUP BY category")
+    .all() as Array<{ category: AssetCategory; count: number }>;
+  // Values are grouped case-insensitively, matching how the tag/license filters compare them.
+  const countJsonValues = (column: "tags_json" | "licenses_json") =>
+    (database
+      .prepare(
+        `
+          SELECT MIN(trim(j.value)) AS value, COUNT(DISTINCT a.id) AS count
+          FROM assets a, json_each(a.${column}) j
+          WHERE a.deleted_at IS NULL AND trim(j.value) <> ''
+          GROUP BY lower(trim(j.value))
+          ORDER BY lower(trim(j.value))
+        `,
+      )
+      .all() as Array<{ value: string; count: number }>)
+      .map((row) => ({ value: row.value, count: Number(row.count) }));
+
+  return {
+    total: Number(totals.total),
+    todo: Number(totals.todo),
+    categories: Object.fromEntries(categoryRows.map((row) => [row.category, Number(row.count)])),
+    tags: countJsonValues("tags_json"),
+    licenses: countJsonValues("licenses_json"),
+  };
+}
+
 export async function setAssetDeleted(id: string, deleted: boolean): Promise<boolean> {
   await ensureStorage();
   const result = getDb().prepare("UPDATE assets SET deleted_at = ? WHERE id = ?").run(
@@ -1280,11 +1347,6 @@ export async function saveAsset(params: {
     }
   }
 
-  const textSnippet =
-    previewKind === "text"
-      ? textDecoder.decode(params.bytes.slice(0, 4_000))
-      : undefined;
-
   const autoMetadata = await generateAutoMetadata({
     title: params.title,
     originalName: params.fileName,
@@ -1292,28 +1354,13 @@ export async function saveAsset(params: {
     mimeType: params.mimeType || "application/octet-stream",
     existingTags: params.tags,
     existingDescription: params.description ?? "",
-    textSnippet,
-    imageFile:
-      category === "texture"
-        ? {
-            mimeType: params.mimeType || "application/octet-stream",
-            bytes: params.bytes,
-          }
-        : undefined,
-    audioFile:
-      category === "audio"
-        ? (() => {
-            const format = getAudioAttachmentFormat(
-              params.fileName,
-              params.mimeType || "application/octet-stream",
-            );
-            if (!format) return undefined;
-            return {
-              format,
-              bytes: params.bytes,
-            };
-          })()
-        : undefined,
+    ...getAutoMetadataAttachments({
+      fileName: params.fileName,
+      mimeType: params.mimeType,
+      category,
+      previewKind,
+      bytes: params.bytes,
+    }),
   });
 
   const fileMetadata = extractAssetFileMetadata({
@@ -1731,6 +1778,81 @@ export async function updateAssetMetadata(
   const updated = await getAssetById(id);
   if (updated) indexAsset(database, updated);
   return updated;
+}
+
+// Re-runs AI tagging for an existing asset. `bytes` holds whatever getAutoMetadataReadSize asked for.
+// User-curated metadata (metadataEdited) is never overwritten, and the flag stays unset.
+export async function regenerateAssetAiMetadata(
+  id: string,
+  bytes: Uint8Array,
+): Promise<"updated" | "skipped" | "not-found"> {
+  const record = await getAssetById(id);
+  if (!record) return "not-found";
+  if (record.metadataEdited) return "skipped";
+
+  const autoMetadata = await generateAutoMetadata({
+    title: record.title,
+    originalName: record.originalName,
+    category: record.category,
+    mimeType: record.mimeType || "application/octet-stream",
+    existingTags: record.tags,
+    existingDescription: record.description,
+    ...getAutoMetadataAttachments({
+      fileName: record.originalName,
+      mimeType: record.mimeType,
+      category: record.category,
+      previewKind: record.previewKind,
+      bytes,
+    }),
+  });
+
+  const database = getDb();
+  // Guard on metadata_edited again: the user may have edited while the AI call was in flight.
+  const result = database
+    .prepare(
+      "UPDATE assets SET description = ?, tags_json = ? WHERE id = ? AND metadata_edited = 0",
+    )
+    .run(autoMetadata.description, JSON.stringify(autoMetadata.tags), id);
+  if (Number(result.changes) === 0) return "skipped";
+
+  const updated = await getAssetById(id);
+  if (updated) indexAsset(database, updated);
+  return "updated";
+}
+
+export async function setAssetFileMetadata(
+  fileId: string,
+  metadata: Record<string, unknown>,
+): Promise<boolean> {
+  await ensureStorage();
+  const result = getDb()
+    .prepare("UPDATE asset_files SET metadata_json = ? WHERE id = ?")
+    .run(JSON.stringify(metadata), fileId);
+  return Number(result.changes) > 0;
+}
+
+// Records a recomputed file hash. The primary file's hash is mirrored on the assets row. A hash that
+// collides with another asset surfaces as a UNIQUE constraint error and leaves both rows unchanged.
+export async function setAssetFileHash(fileId: string, hash: string): Promise<boolean> {
+  await ensureStorage();
+  const database = getDb();
+  const file = database
+    .prepare("SELECT asset_id, stored_name FROM asset_files WHERE id = ?")
+    .get(fileId) as { asset_id: string; stored_name: string } | undefined;
+  if (!file) return false;
+
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.prepare("UPDATE asset_files SET hash = ? WHERE id = ?").run(hash, fileId);
+    database
+      .prepare("UPDATE assets SET hash = ? WHERE id = ? AND stored_name = ?")
+      .run(hash, file.asset_id, file.stored_name);
+    database.exec("COMMIT");
+  } catch (errorValue) {
+    database.exec("ROLLBACK");
+    throw errorValue;
+  }
+  return true;
 }
 
 export async function replaceAssetFile(

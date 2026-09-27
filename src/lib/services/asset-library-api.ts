@@ -1,4 +1,4 @@
-import type { AssetView } from "$lib/types";
+import type { AssetFacets, AssetListQuery, AssetView } from "$lib/types";
 
 export type AiConfig = {
   enabled: boolean;
@@ -92,10 +92,24 @@ export class AssetLibraryApiService {
     return payload.assets;
   }
 
-  async listAssetsPage(page: number): Promise<AssetListPage> {
-    const response = await fetch(`/api/assets?page=${page}&pageSize=40`);
+  async listAssetsPage(page: number, query: AssetListQuery = {}): Promise<AssetListPage> {
+    const params = new URLSearchParams({ page: String(page), pageSize: "40" });
+    if (query.q?.trim()) params.set("q", query.q.trim());
+    if (query.categories?.length) params.set("category", query.categories.join(","));
+    for (const tag of query.tags ?? []) params.append("tag", tag);
+    for (const license of query.licenses ?? []) params.append("license", license);
+    if (query.todoOnly) params.set("todo", "1");
+    if (query.sort) params.set("sort", query.sort);
+
+    const response = await fetch(`/api/assets?${params}`);
     if (!response.ok) throw new Error("Failed to load assets.");
     return (await response.json()) as AssetListPage;
+  }
+
+  async getAssetFacets(): Promise<AssetFacets> {
+    const response = await fetch("/api/assets/facets");
+    if (!response.ok) throw new Error("Failed to load filters.");
+    return (await response.json()) as AssetFacets;
   }
 
   async uploadAsset(

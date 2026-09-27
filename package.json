@@ -31,7 +31,6 @@
     "@ai-sdk/openai": "^3.0.41",
     "@iconify/svelte": "^5.2.1",
     "ai": "^6.0.116",
-    "fuse.js": "^7.1.0",
     "image-size": "^1.1.0",
     "svelte-sonner": "^1.0.8",
     "three": "^0.183.2",

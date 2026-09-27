@@ -1,10 +1,12 @@
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let baseDir = "";
 let rootDir = "";
+// DB handles opened by module instances created after vi.resetModules; closed before the temp dir is removed.
+let storageResets: Array<() => void> = [];
 
 async function loadModule() {
   return import("$lib/server/external-library");
@@ -19,6 +21,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  for (const reset of storageResets) reset();
+  storageResets = [];
   delete process.env.ASSET_LIBRARY_DATA_DIR;
   delete process.env.ASSET_LIBRARY_EXTERNAL_ROOT;
   await rm(baseDir, { recursive: true, force: true });
@@ -117,5 +121,80 @@ describe("external library import pause/resume", () => {
     expect(done.paused).toBe(false);
     expect(done.processed).toBe(done.total);
     expect(done.imported).toBeGreaterThan(0);
+  });
+});
+describe("external library import persistence", () => {
+  async function restartModule() {
+    vi.resetModules();
+    const mod = await loadModule();
+    storageResets.push((await import("$lib/server/assets")).resetStorageForTests);
+    return mod;
+  }
+
+  it("restores a paused import after a restart and finishes the remaining files", async () => {
+    // Fresh module so its data root is this test's temp directory.
+    const mod = await restartModule();
+    const paths = await setupScannedLibrary(
+      mod,
+      Array.from({ length: 30 }, (_, i) => `restart-${i}.glb`),
+    );
+
+    mod.startExternalLibraryImport(paths);
+    while (mod.getExternalLibraryImportStatus().processed === 0) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    mod.pauseExternalLibraryImport();
+    while (mod.getExternalLibraryImportStatus().currentFile !== null) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const beforeRestart = mod.getExternalLibraryImportStatus();
+
+    const restarted = await restartModule();
+    const restored = restarted.getExternalLibraryImportStatus();
+    expect(restored).toMatchObject({
+      running: true,
+      paused: true,
+      total: beforeRestart.total,
+      processed: beforeRestart.processed,
+    });
+
+    restarted.resumeExternalLibraryImport();
+    while (restarted.getExternalLibraryImportStatus().running) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const done = restarted.getExternalLibraryImportStatus();
+    expect(done.processed).toBe(done.total);
+    expect(done.imported + done.skipped).toBe(done.total);
+    expect(done.errors).toBe(0);
+  });
+
+  it("comes back paused when the server stopped mid-import", async () => {
+    await writeFile(
+      path.join(baseDir, "external-library-import-state.json"),
+      JSON.stringify({
+        job: {
+          running: true,
+          paused: false,
+          total: 3,
+          processed: 1,
+          imported: 1,
+          skipped: 0,
+          errors: 0,
+          startedAt: "2026-01-01T00:00:00.000Z",
+          finishedAt: null,
+          pausedAt: null,
+          error: null,
+          currentFile: "b.glb",
+          lastErrorFile: null,
+        },
+        remainingPaths: ["b.glb", "c.glb"],
+      }),
+    );
+
+    const mod = await restartModule();
+    const status = mod.getExternalLibraryImportStatus();
+    expect(status).toMatchObject({ running: true, paused: true, processed: 1, currentFile: null });
+    expect(status.pausedAt).not.toBeNull();
+    expect(() => mod.startExternalLibraryImport(["a.glb"])).toThrow("An import is already in progress.");
   });
 });

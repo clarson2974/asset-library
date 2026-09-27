@@ -1,5 +1,10 @@
-import { redirect, type Handle } from "@sveltejs/kit";
+import { redirect, type Handle, type ServerInit } from "@sveltejs/kit";
 import { getSessionFromCookies } from "$lib/server/auth";
+import { startJobWorker } from "$lib/server/job-worker";
+
+export const init: ServerInit = () => {
+  startJobWorker();
+};
 
 const PUBLIC_PATHS = [
   "/login",

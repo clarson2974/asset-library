@@ -47,7 +47,8 @@ See [TESTING.md](TESTING.md) for test isolation and current coverage. Add focuse
 
 ## Safety and scope
 
-- Authentication and authorization are not implemented yet. All current endpoints are public; do not imply that the application is safe for internet exposure.
+- Every route except login, logout, `me`, and health requires a session (`src/hooks.server.ts`). Every API handler must check a capability with `requireUserCapability` and return 403 when it fails; new routes must do the same. Roles are `admin`, `editor`, and `viewer`.
+- The first admin is seeded from `ADMIN_EMAIL`/`ADMIN_PASSWORD` and defaults to `admin@localhost` / `admin`. Do not imply the application is safe for direct internet exposure: there is no rate limiting, audit log, or user management UI yet.
 - Protect path resolution, upload handling, replacement, deletion, and download/preview routes against traversal, arbitrary filesystem access, oversized input, and partial writes.
 - Never commit `.env`, API keys, session secrets, `data/`, uploaded assets, database files, or generated output.
 - Preserve existing user data when changing the SQLite schema. Add an explicit migration and backup/rollback notes before changing persisted structures; do not rely on startup schema creation as a migration system.

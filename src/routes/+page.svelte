@@ -1,12 +1,11 @@
 <script lang="ts">
   import Icon from "@iconify/svelte";
-  import Fuse from "fuse.js";
   import { toast } from "svelte-sonner";
   import { onMount } from "svelte";
   import { replaceState } from "$app/navigation";
   import { browser } from "$app/environment";
   import { env as publicEnv } from "$env/dynamic/public";
-  import type { AssetCategory, AssetView } from "$lib/types";
+  import type { AssetCategory, AssetFacets, AssetListQuery, AssetView } from "$lib/types";
   import AssetCard from "$lib/components/AssetCard.svelte";
   import Button from "$lib/components/Button.svelte";
   import Dialog from "$lib/components/Dialog.svelte";
@@ -173,8 +172,13 @@
     publicEnv.PUBLIC_UPLOAD_PARALLELISM,
   );
   const textPreviews: Record<string, string> = {};
-  let fuzzyMatchedAssetIds: Set<string> | null = null;
-  let fuzzyRankByAssetId: Map<string, number> | null = null;
+  let facets: AssetFacets | null = null;
+  let hasLoadedAssets = false;
+  // Incremented per list request so a slow response for an old query never replaces newer results.
+  let assetRequestSeq = 0;
+  let debouncedSearchQuery = "";
+  let searchDebounceHandle: ReturnType<typeof setTimeout> | null = null;
+  let lastAssetQueryKey = "";
 
   function parseUploadParallelism(rawValue: string | undefined): number {
     const parsed = Number.parseInt(rawValue ?? "", 10);
@@ -185,134 +189,34 @@
   }
 
   $: normalizedSearchQuery = searchQuery.trim();
-  $: {
-    const q = normalizedSearchQuery;
-    if (!q) {
-      fuzzyMatchedAssetIds = null;
-      fuzzyRankByAssetId = null;
-    } else {
-      const fuse = new Fuse(assets, {
-        threshold: 0.35,
-        ignoreLocation: true,
-        minMatchCharLength: 2,
-        keys: [
-          { name: "title", weight: 0.35 },
-          { name: "description", weight: 0.25 },
-          { name: "tags", weight: 0.2 },
-          { name: "fileType", weight: 0.15 },
-          { name: "originalName", weight: 0.15 },
-          { name: "category", weight: 0.05 },
-        ],
-      });
+  $: scheduleSearch(normalizedSearchQuery);
 
-      const results = fuse.search(q);
-      fuzzyMatchedAssetIds = new Set(results.map((result) => result.item.id));
-      fuzzyRankByAssetId = new Map(
-        results.map((result, index) => [result.item.id, index]),
-      );
-    }
-  }
+  // Search, filters, and sort all run on the server, so results cover the whole library,
+  // not just the pages loaded so far.
+  $: assetQuery = {
+    q: debouncedSearchQuery,
+    categories: selectedCategories,
+    tags: selectedFilterTags,
+    licenses: selectedFilterLicenses,
+    todoOnly: showTodoOnly,
+    sort: sortMode,
+  } satisfies AssetListQuery;
+  $: onAssetQueryChanged(assetQuery, didHydrateFiltersFromUrl);
 
-  $: visibleAssets = (() => {
-    const filteredAssets = assets.filter((asset) => {
-      const matchesQuery =
-        !normalizedSearchQuery || !!fuzzyMatchedAssetIds?.has(asset.id);
-      const matchesTodo = !showTodoOnly || !asset.metadataEdited;
-      const matchesCategory =
-        selectedCategories.length === 0 ||
-        selectedCategories.includes(asset.category);
-      const matchesTags = selectedFilterTags.every((selectedTag) =>
-        asset.tags.some(
-          (assetTag) => assetTag.toLowerCase() === selectedTag.toLowerCase(),
-        ),
-      );
-      const matchesLicenses = selectedFilterLicenses.every((selectedLicense) =>
-        (asset.licenses ?? []).some(
-          (assetLicense) =>
-            assetLicense.toLowerCase() === selectedLicense.toLowerCase(),
-        ),
-      );
-      return (
-        matchesQuery &&
-        matchesTodo &&
-        matchesCategory &&
-        matchesTags &&
-        matchesLicenses
-      );
-    });
-
-    return [...filteredAssets].sort((left, right) => {
-      if (sortMode === "oldest") {
-        return Date.parse(left.uploadDate) - Date.parse(right.uploadDate);
-      }
-
-      if (sortMode === "title-asc") {
-        return left.title.localeCompare(right.title, undefined, {
-          sensitivity: "base",
-        });
-      }
-
-      if (sortMode === "size-desc") {
-        return right.size - left.size;
-      }
-
-      if (sortMode === "needs-metadata") {
-        if (left.metadataEdited !== right.metadataEdited) {
-          return left.metadataEdited ? 1 : -1;
-        }
-        return Date.parse(right.uploadDate) - Date.parse(left.uploadDate);
-      }
-
-      if (sortMode === "best-match") {
-        if (normalizedSearchQuery && fuzzyRankByAssetId) {
-          const leftRank =
-            fuzzyRankByAssetId.get(left.id) ?? Number.MAX_SAFE_INTEGER;
-          const rightRank =
-            fuzzyRankByAssetId.get(right.id) ?? Number.MAX_SAFE_INTEGER;
-
-          if (leftRank !== rightRank) {
-            return leftRank - rightRank;
-          }
-        }
-
-        return Date.parse(right.uploadDate) - Date.parse(left.uploadDate);
-      }
-
-      return Date.parse(right.uploadDate) - Date.parse(left.uploadDate);
-    });
-  })();
-
-  $: todoCount = assets.filter((asset) => !asset.metadataEdited).length;
-  $: allKnownTags = Array.from(
-    new Set(
-      assets.flatMap((asset) =>
-        asset.tags.map((tag) => tag.trim()).filter(Boolean),
-      ),
-    ),
-  ).sort((a, b) => a.localeCompare(b));
+  $: visibleAssets = assets;
+  $: libraryTotalCount = facets?.total ?? assetTotalCount;
+  $: todoCount = facets?.todo ?? 0;
+  $: allKnownTags = (facets?.tags ?? []).map((entry) => entry.value);
   $: categoryCounts = categoryOrder.map((category) => ({
     category,
-    count: assets.filter((asset) => asset.category === category).length,
+    count: facets?.categories[category] ?? 0,
   }));
-  $: tagCountMap = assets.reduce<Record<string, number>>((counts, asset) => {
-    for (const tag of asset.tags) {
-      const key = tag.trim().toLowerCase();
-      if (!key) continue;
-      counts[key] = (counts[key] ?? 0) + 1;
-    }
-    return counts;
-  }, {});
-  $: licenseCountMap = assets.reduce<Record<string, number>>(
-    (counts, asset) => {
-      for (const license of asset.licenses ?? []) {
-        const key = license.trim().toLowerCase();
-        if (!key) continue;
-        counts[key] = (counts[key] ?? 0) + 1;
-      }
-      return counts;
-    },
-    {},
-  );
+  $: tagCountMap = Object.fromEntries(
+    (facets?.tags ?? []).map((entry) => [entry.value.toLowerCase(), entry.count]),
+  ) as Record<string, number>;
+  $: licenseCountMap = Object.fromEntries(
+    (facets?.licenses ?? []).map((entry) => [entry.value.toLowerCase(), entry.count]),
+  ) as Record<string, number>;
   $: normalizedFilterTagQuery = filterTagQuery.trim().toLowerCase();
   $: normalizedFilterLicenseQuery = filterLicenseQuery.trim().toLowerCase();
   $: filteredTagRows = allKnownTags
@@ -657,28 +561,62 @@
     void processUploadQueue();
   }
 
-  async function loadAssets(): Promise<void> {
-    loading = true;
+  function scheduleSearch(query: string): void {
+    if (searchDebounceHandle) clearTimeout(searchDebounceHandle);
+    if (query === debouncedSearchQuery) return;
+    searchDebounceHandle = setTimeout(() => {
+      debouncedSearchQuery = query;
+    }, 250);
+  }
+
+  function onAssetQueryChanged(query: AssetListQuery, hydrated: boolean): void {
+    // Wait for URL filters to hydrate so the first request already uses them.
+    if (!browser || !hydrated) return;
+    const key = JSON.stringify(query);
+    if (key === lastAssetQueryKey) return;
+    lastAssetQueryKey = key;
+    void loadAssets();
+  }
+
+  async function loadFacets(): Promise<void> {
     try {
-      const result = await api.listAssetsPage(1);
+      facets = await api.getAssetFacets();
+    } catch {
+      // Filter counts are best-effort; the asset list still works without them.
+    }
+  }
+
+  async function loadAssets(): Promise<void> {
+    const requestSeq = ++assetRequestSeq;
+    // Only the first load replaces the grid with a placeholder; later queries swap results in place.
+    loading = !hasLoadedAssets;
+    void loadFacets();
+    try {
+      const result = await api.listAssetsPage(1, assetQuery);
+      if (requestSeq !== assetRequestSeq) return;
       assets = result.assets;
       assetPage = result.pagination.page;
       assetTotalPages = result.pagination.totalPages;
       assetTotalCount = result.pagination.total;
+      hasLoadedAssets = true;
     } catch (error) {
+      if (requestSeq !== assetRequestSeq) return;
       toast.error(
         error instanceof Error ? error.message : "Failed to load assets.",
       );
     } finally {
-      loading = false;
+      if (requestSeq === assetRequestSeq) loading = false;
     }
   }
 
   async function loadMoreAssets(): Promise<void> {
     if (loadingMore || assetPage >= assetTotalPages) return;
+    const requestSeq = assetRequestSeq;
     loadingMore = true;
     try {
-      const result = await api.listAssetsPage(assetPage + 1);
+      const result = await api.listAssetsPage(assetPage + 1, assetQuery);
+      // The query changed while this page was loading; its results belong to the old list.
+      if (requestSeq !== assetRequestSeq) return;
       assets = [...assets, ...result.assets];
       assetPage = result.pagination.page;
       assetTotalPages = result.pagination.totalPages;
@@ -1133,7 +1071,6 @@
     return `${(kb / 1024).toFixed(2)} MB`;
   }
 
-  onMount(loadAssets);
   onMount(loadAiConfig);
   onMount(loadExternalLibrary);
   onMount(async () => {
@@ -1200,7 +1137,7 @@
       />
       <h1>Asset Library</h1>
       <div class="assetlib-title-stats">
-        <span>{assetTotalCount}</span>
+        <span>{libraryTotalCount}</span>
         {#if uploadPendingCount > 0}
           <span class="active assetlib-upload-indicator" aria-live="polite">
             <Icon
@@ -1331,7 +1268,7 @@
 
         {#if loading}
           <p>Loading assets...</p>
-        {:else if assets.length === 0}
+        {:else if libraryTotalCount === 0}
           <p>No assets yet, get started by dragging and dropping files here.</p>
         {:else if visibleAssets.length === 0}
           <p>No assets match this filter.</p>

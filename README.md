@@ -23,14 +23,12 @@ A simple **self-hosted asset library** for your game development needs, availabl
 - 🔎 Strong filtering and searching functionalities
   - 🏷️ Filtering by tag, type, ...
   - ↕️ Many sorting options
-  - 🧠 Fuzzy search using Fuse.js
+  - 🧠 Server-side full-text search (SQLite FTS5) with paginated results
 
 - 🧬 File deduplication using hashes
 - 📁 Built-in SQLite metadata storage (no external database needed)
-
-🚧 Currently not available
-
-- User accounts / permissions
+- 🔐 Login with admin / editor / viewer roles
+- 📚 External library import that links files in place (pausable, survives restarts)
 
 # 🚀 Quick Start
 
@@ -43,6 +41,8 @@ services:
     environment:
       - ORIGIN=http://localhost:3000 # Adjust if using a domain or reverse proxy
       - PUBLIC_UPLOAD_PARALLELISM=4 # Number of files uploaded in parallel from the UI (default: 4)
+      - ADMIN_EMAIL=admin@localhost # First admin account, created on first start
+      - ADMIN_PASSWORD=change-me # Defaults to "admin" if unset: change it!
     ports:
       - "3000:3000"
     volumes:
@@ -62,7 +62,9 @@ The app will be available on port 3000, ready to accept your uploads!
 
 `PUBLIC_UPLOAD_PARALLELISM` controls how many files are uploaded in parallel by the UI upload queue. The default is `4` (parallel uploads). Set it to a higher value to process multiple files at once.
 
-Please run this behind a reverse proxy and do not expose this directly on the internet without proper authentication!
+On first start the app creates an admin account from `ADMIN_EMAIL` and `ADMIN_PASSWORD` (defaults: `admin@localhost` / `admin`). Set your own password before the first start.
+
+Please run this behind a reverse proxy and do not expose it directly on the internet.
 
 In case you obsere failing requests when uploading large files, make sure that your reverse proxy allows uploading files of that size.
 
@@ -73,6 +75,8 @@ At runtime the app creates a `data/` directory in the project root:
 - `data/assets.db`: SQLite metadata database
 - `data/ai-config.json`: AI metadata generation configuration (optional)
 - `data/uploads/`: uploaded files
+- `data/.backups/`: automatic database backups taken before schema migrations
+- `data/external-library-*.json`: external library config, last scan, and in-progress import state
 
 This keeps setup **very small and easy to back up**.
 
@@ -143,7 +147,6 @@ Roadmap:
 - Bulk actions (tagging, deleting, downloading)
 - Metadata generation for 3D models
 - Add support for more file types (e.g. video, fonts, ...)
-- User accounts and permissions
 - Improved infinite scrolling/padination for large libraries
 - Better responsiveness for mobile devices
 

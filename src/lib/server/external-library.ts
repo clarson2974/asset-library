@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { computeFileHash, DuplicateAssetError, saveExternalAsset } from "$lib/server/assets";
 
@@ -63,6 +63,7 @@ const dataRoot = path.resolve(
 );
 const configPath = path.join(dataRoot, "external-library-config.json");
 const statePath = path.join(dataRoot, "external-library-scan-state.json");
+const importStatePath = path.join(dataRoot, "external-library-import-state.json");
 
 function ensureDataDirectory(): void {
   mkdirSync(dataRoot, { recursive: true });
@@ -574,26 +575,102 @@ export type ExternalLibraryImportJobStatus = {
 // Hard ceiling per file so a single unresponsive AI backend or corrupt file can't stall the whole import.
 const IMPORT_FILE_TIMEOUT_MS = 180_000;
 
-let importJob: ExternalLibraryImportJobStatus = {
-  running: false,
-  paused: false,
-  total: 0,
-  processed: 0,
-  imported: 0,
-  skipped: 0,
-  errors: 0,
-  startedAt: null,
-  finishedAt: null,
-  pausedAt: null,
-  error: null,
-  currentFile: null,
-  lastErrorFile: null,
+function idleImportJob(): ExternalLibraryImportJobStatus {
+  return {
+    running: false,
+    paused: false,
+    total: 0,
+    processed: 0,
+    imported: 0,
+    skipped: 0,
+    errors: 0,
+    startedAt: null,
+    finishedAt: null,
+    pausedAt: null,
+    error: null,
+    currentFile: null,
+    lastErrorFile: null,
+  };
+}
+
+let importJob: ExternalLibraryImportJobStatus = idleImportJob();
+
+// The loop walks importPaths with a cursor; a path only counts as done once the cursor moves past it,
+// so a paused or interrupted import resumes without reprocessing finished files.
+let importPaths: string[] = [];
+let importCursor = 0;
+let importLoopActive = false;
+let importStateLoaded = false;
+let lastImportPersistAt = 0;
+
+// Snapshots are throttled because the remaining-path list can hold tens of thousands of entries.
+// Files finished after the last snapshot are re-hashed on resume and skipped as duplicates.
+const IMPORT_PERSIST_INTERVAL_MS = 2_000;
+
+type PersistedImportState = {
+  job: ExternalLibraryImportJobStatus;
+  remainingPaths: string[];
 };
 
-// Relative paths that have not been processed yet. The loop drains this list,
-// so a paused import can be resumed later without reprocessing finished files.
-let importRemainingPaths: string[] = [];
-let importLoopActive = false;
+function persistImportState(): void {
+  lastImportPersistAt = Date.now();
+  try {
+    ensureDataDirectory();
+    const snapshot: PersistedImportState = {
+      job: { ...importJob, currentFile: null },
+      remainingPaths: importPaths.slice(importCursor),
+    };
+    const tempPath = `${importStatePath}.tmp`;
+    writeFileSync(tempPath, JSON.stringify(snapshot), "utf8");
+    renameSync(tempPath, importStatePath);
+  } catch (errorValue) {
+    console.error("[external-library-import] failed to persist import state", {
+      error: errorValue instanceof Error ? errorValue.message : String(errorValue),
+    });
+  }
+}
+
+function persistImportStateThrottled(): void {
+  if (Date.now() - lastImportPersistAt >= IMPORT_PERSIST_INTERVAL_MS) {
+    persistImportState();
+  }
+}
+
+// Restores the last import from disk once per process. An import that was running when the server
+// stopped comes back paused, so it resumes only when a user asks and is never silently dropped.
+function ensureImportStateLoaded(): void {
+  if (importStateLoaded) {
+    return;
+  }
+  importStateLoaded = true;
+
+  let persisted: PersistedImportState;
+  try {
+    persisted = JSON.parse(readFileSync(importStatePath, "utf8")) as PersistedImportState;
+  } catch {
+    return;
+  }
+  if (!persisted?.job || !Array.isArray(persisted.remainingPaths)) {
+    return;
+  }
+
+  importJob = { ...idleImportJob(), ...persisted.job, currentFile: null };
+  importPaths = persisted.remainingPaths.filter((value): value is string => typeof value === "string");
+  importCursor = 0;
+
+  if (importJob.running) {
+    if (importPaths.length === 0) {
+      importJob.running = false;
+      importJob.paused = false;
+      importJob.pausedAt = null;
+      importJob.finishedAt = importJob.finishedAt ?? new Date().toISOString();
+    } else if (!importJob.paused) {
+      importJob.paused = true;
+      importJob.pausedAt = new Date().toISOString();
+    }
+    persistImportState();
+  }
+}
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -614,6 +691,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
 }
 
 export function getExternalLibraryImportStatus(): ExternalLibraryImportJobStatus {
+  ensureImportStateLoaded();
   return { ...importJob };
 }
 
@@ -629,15 +707,15 @@ async function runExternalLibraryImport(): Promise<void> {
         .map((entry) => [entry.relativePath, entry]),
     );
 
-    while (importRemainingPaths.length > 0 && !importJob.paused) {
-      const relativePath = importRemainingPaths[0];
-      importRemainingPaths = importRemainingPaths.slice(1);
+    while (importCursor < importPaths.length && !importJob.paused) {
+      const relativePath = importPaths[importCursor];
 
       const entry = entryByPath.get(relativePath);
       if (!entry) {
         // The file is no longer part of the latest scan; drop it from the queue.
         importJob.skipped += 1;
         importJob.processed += 1;
+        importCursor += 1;
         continue;
       }
 
@@ -677,11 +755,14 @@ async function runExternalLibraryImport(): Promise<void> {
       } finally {
         importJob.processed += 1;
         importJob.currentFile = null;
+        importCursor += 1;
+        persistImportStateThrottled();
       }
     }
   } catch (errorValue) {
     importJob.error = errorValue instanceof Error ? errorValue.message : String(errorValue);
-    importRemainingPaths = [];
+    importPaths = [];
+    importCursor = 0;
   } finally {
     importLoopActive = false;
     importJob.currentFile = null;
@@ -689,19 +770,24 @@ async function runExternalLibraryImport(): Promise<void> {
     if (importJob.paused) {
       // The job stays open in a paused state: polling continues and new
       // imports stay blocked until the paused job is resumed or finished.
-    } else if (importRemainingPaths.length > 0) {
+      persistImportState();
+    } else if (importCursor < importPaths.length) {
       // Pause was requested and cleared again while the loop was exiting;
       // resume the remainder so files are never silently dropped.
       void runExternalLibraryImport();
     } else {
       importJob.running = false;
       importJob.finishedAt = new Date().toISOString();
+      importPaths = [];
+      importCursor = 0;
+      persistImportState();
     }
   }
 }
 
 // Requests that the running import stops after the file currently in flight.
 export function pauseExternalLibraryImport(): ExternalLibraryImportJobStatus {
+  ensureImportStateLoaded();
   if (!importJob.running) {
     throw new Error("No import is currently running.");
   }
@@ -709,6 +795,7 @@ export function pauseExternalLibraryImport(): ExternalLibraryImportJobStatus {
   if (!importJob.paused) {
     importJob.paused = true;
     importJob.pausedAt = new Date().toISOString();
+    persistImportState();
   }
 
   return { ...importJob };
@@ -716,12 +803,14 @@ export function pauseExternalLibraryImport(): ExternalLibraryImportJobStatus {
 
 // Restarts a paused import, continuing with the files that have not been processed yet.
 export function resumeExternalLibraryImport(): ExternalLibraryImportJobStatus {
+  ensureImportStateLoaded();
   if (!importJob.running || !importJob.paused) {
     throw new Error("No paused import to resume.");
   }
 
   importJob.paused = false;
   importJob.pausedAt = null;
+  persistImportState();
 
   if (!importLoopActive) {
     void runExternalLibraryImport();
@@ -732,26 +821,20 @@ export function resumeExternalLibraryImport(): ExternalLibraryImportJobStatus {
 
 // Kicks off the import in the background and returns immediately so callers don't block on 65k+ file imports.
 export function startExternalLibraryImport(relativePaths: string[]): ExternalLibraryImportJobStatus {
+  ensureImportStateLoaded();
   if (importJob.running) {
     throw new Error("An import is already in progress.");
   }
 
   importJob = {
+    ...idleImportJob(),
     running: true,
-    paused: false,
     total: relativePaths.length,
-    processed: 0,
-    imported: 0,
-    skipped: 0,
-    errors: 0,
     startedAt: new Date().toISOString(),
-    finishedAt: null,
-    pausedAt: null,
-    error: null,
-    currentFile: null,
-    lastErrorFile: null,
   };
-  importRemainingPaths = [...relativePaths];
+  importPaths = [...relativePaths];
+  importCursor = 0;
+  persistImportState();
 
   void runExternalLibraryImport();
 

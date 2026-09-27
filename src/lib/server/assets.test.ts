@@ -400,3 +400,44 @@ describe("asset storage", () => {
     }
   });
 });
+describe("asset facets", () => {
+  it("counts categories, tags, and licenses case-insensitively and skips soft-deleted assets", async () => {
+    const assets = await loadAssetsModule();
+    await assets.saveAsset({
+      title: "One",
+      tags: ["Nature", "rock"],
+      licenses: ["CC0"],
+      fileName: "one.txt",
+      mimeType: "text/plain",
+      size: 3,
+      bytes: new TextEncoder().encode("one"),
+    });
+    await assets.saveAsset({
+      title: "Two",
+      tags: ["nature"],
+      licenses: ["cc0"],
+      fileName: "two.png",
+      mimeType: "image/png",
+      size: 3,
+      bytes: new TextEncoder().encode("two"),
+    });
+    const deleted = await assets.saveAsset({
+      title: "Three",
+      tags: ["nature", "hidden"],
+      fileName: "three.txt",
+      mimeType: "text/plain",
+      size: 5,
+      bytes: new TextEncoder().encode("three"),
+    });
+    await assets.setAssetDeleted(deleted.id, true);
+
+    const facets = await assets.getAssetFacets();
+    expect(facets.total).toBe(2);
+    expect(facets.categories).toMatchObject({ texture: 1 });
+    expect(facets.tags.map((entry) => [entry.value.toLowerCase(), entry.count])).toEqual([
+      ["nature", 2],
+      ["rock", 1],
+    ]);
+    expect(facets.licenses.map((entry) => [entry.value.toLowerCase(), entry.count])).toEqual([["cc0", 2]]);
+  });
+});
